@@ -17,6 +17,7 @@ Ensure you have your production environment secrets ready:
 | `RAZORPAY_WEBHOOK_SECRET` | Webhook signature secret | `...` |
 | `MAX_AUTONOMOUS_AMOUNT` | Max ₹ amount AI can retry/charge without human review | `10000` |
 | `MAX_RETRY_ATTEMPTS` | Bounded autonomy attempt limit | `2` |
+| `DATABASE_URL` | PostgreSQL production connection URL | `postgresql://...` |
 
 ---
 
@@ -128,3 +129,17 @@ Use the provided [backend Dockerfile](C:/RecoverAi/backend/Dockerfile) and [fron
 - **Card Network Protection**: Expired cards are blocked from repeated retries and automatically rerouted to multi-method payment links (`SEND_PAYMENT_LINK`).
 - **Autonomous Ceiling**: Any transaction above `MAX_AUTONOMOUS_AMOUNT` (₹10,000) is deterministically blocked from autonomous execution and escalated to the **Human Review Queue**.
 - **Tamper-Proof Audit Trail**: Every decision, score, plan, and outcome is permanently committed to `audit_logs`.
+
+## 6. PostgreSQL migration and native-first smoke test
+
+For PostgreSQL production deployments, apply migrations in numeric order before starting the new API image:
+
+```bash
+psql "$DATABASE_URL" -f backend/migrations/postgres/001_initial.sql
+psql "$DATABASE_URL" -f backend/migrations/postgres/002_ghost_revenue.sql
+psql "$DATABASE_URL" -f backend/migrations/postgres/003_recovery_link_guard.sql
+```
+
+`003_recovery_link_guard.sql` creates the tenant-scoped `recovery_links` guard used by automatic and manual dispatch. Do not deploy the application change without it.
+
+Before production traffic, verify in staging that native Razorpay retry/alternate-checkout cases create no RecoverAI link or customer contact; a transient failure waits and rechecks before one eligible link; repeated events keep monitoring the same link; and captured payments only reconcile or open a Ghost Revenue incident.

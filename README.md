@@ -7,7 +7,7 @@
 [![Python](https://img.shields.io/badge/Language-Python%203.11+-3776AB?style=flat&logo=python&logoColor=white)](https://www.python.org)
 [![Razorpay](https://img.shields.io/badge/Payments-Razorpay%20API%20v1-0C2340?style=flat&logo=razorpay&logoColor=white)](https://razorpay.com)
 [![Scikit-Learn](https://img.shields.io/badge/ML-Random%20Forest%20Classifier-F7931E?style=flat&logo=scikit-learn&logoColor=white)](https://scikit-learn.org)
-[![Tests](https://img.shields.io/badge/Tests-47%20Passed-brightgreen?style=flat&logo=pytest&logoColor=white)](#proof-it-works)
+[![Tests](https://img.shields.io/badge/Tests-49%20Passed-brightgreen?style=flat&logo=pytest&logoColor=white)](#proof-it-works)
 [![Security](https://img.shields.io/badge/Multi--Tenancy-JWT%20%2B%20PBKDF2%20Isolated-blueviolet?style=flat)](#authentication--multi-tenancy)
 
 > **Buildathon Track:** Razorpay AI Buildathon — *AI Revenue Recovery (Track 03)*  
@@ -211,6 +211,24 @@ RecoverAI evaluates incoming failure reasons against distinct playbooks and row-
 
 ---
 
+## Native-First Razorpay Recovery
+
+RecoverAI treats Razorpay as the owner of a recovery path whenever Razorpay is already retrying or presenting an alternate checkout. It never claims those outcomes as RecoverAI recovery.
+
+| Situation | RecoverAI behavior |
+| :--- | :--- |
+| `INTERNATIONAL_CARD_UNSUPPORTED` | Monitor Razorpay alternate checkout silently; do not create a link, retry, message, or Promise-to-Pay. |
+| `SUBSCRIPTION_RETRY_ACTIVE` | Monitor Razorpay native subscription retry silently; do not create a duplicate recovery path. |
+| `BANK_SERVER_DOWN`, `NETWORK_TIMEOUT`, `INSUFFICIENT_FUNDS` | Persist a cooldown job, recheck the gateway/payment state, then create at most one eligible RecoverAI link. |
+| Razorpay `captured` / `paid` | Stop all recovery actions. An unmatched capture becomes a tenant-scoped Ghost Revenue Hunter incident for explicit reconciliation. |
+
+### Dispatch and activity semantics
+
+`recovery_links` enforces one tenant-scoped RecoverAI link per original failed payment for both automated and manual dispatch. A live customer delivery is recorded only after Razorpay returns a successful payment-link response. The activity feed distinguishes cooldown waiting, gateway recheck, Razorpay-native monitoring, live dispatch, simulated/test-only output, existing-link monitoring, and Ghost Revenue reconciliation.
+
+Promise-to-Pay is limited to genuinely unpaid `SUBSCRIPTION_HALTED` and `INVOICE_OVERDUE` cases. It is unavailable for captured payments, active native retries, and ordinary failed-card cases.
+
+---
 ## AI + ML Architecture
 
 RecoverAI adopts a decoupled, layered ML/AI pipeline to ensure speed, explainability, and safety.
