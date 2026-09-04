@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: recoverai-api
+    runtime: docker
+    plan: free
+    region: singapore
+    dockerfilePath: ./backend/Dockerfile
+    dockerContext: ./backend
+    healthCheckPath: /readyz
+    envVars:
+      - key: RECOVERAI_ENVIRONMENT
+        value: production
+      - key: LOG_FILE
+        value: ""
+      - key: JWT_SECRET_KEY
+        generateValue: true

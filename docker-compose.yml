@@ -1,0 +1,56 @@
+services:
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: recoverai-backend
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      # Keep mutable SQLite data outside the application directory. Mounting a
+      # volume at /app would otherwise hide the image's source files at runtime.
+      - DATABASE_URL=/app/data/recoverai.db
+      - LLM_PROVIDER=groq
+      - GROQ_API_KEY=${GROQ_API_KEY}
+      - GROQ_MODEL=${GROQ_MODEL:-llama-3.1-8b-instant}
+      - RAZORPAY_KEY_ID=${RAZORPAY_KEY_ID}
+      - RAZORPAY_KEY_SECRET=${RAZORPAY_KEY_SECRET}
+      - RAZORPAY_WEBHOOK_SECRET=${RAZORPAY_WEBHOOK_SECRET}
+      - MAX_AUTONOMOUS_AMOUNT=10000
+      - RECOVERAI_ENVIRONMENT=${RECOVERAI_ENVIRONMENT:-production}
+      - JWT_SECRET_KEY=${JWT_SECRET_KEY}
+      - APP_BASE_URL=${APP_BASE_URL:-http://localhost:3000}
+      - CORS_ORIGINS=${CORS_ORIGINS:-http://localhost:3000}
+      - SMTP_HOST=${SMTP_HOST:-}
+      - SMTP_PORT=${SMTP_PORT:-587}
+      - SMTP_FROM=${SMTP_FROM:-}
+      - SMTP_USERNAME=${SMTP_USERNAME:-}
+      - SMTP_PASSWORD=${SMTP_PASSWORD:-}
+      - LOG_FILE=/app/data/recoverai.log
+    volumes:
+      - recoverai-data:/app/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/readyz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: recoverai-frontend
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      # This URL is used by the user's browser, so it must resolve from the
+      # host machine rather than only inside the Docker network.
+      - NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL:-http://localhost:8000}
+    depends_on:
+      backend:
+        condition: service_healthy
+
+volumes:
+  recoverai-data:

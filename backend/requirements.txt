@@ -1,0 +1,28 @@
+# Core dependencies
+pydantic>=2.7.0
+python-dotenv>=1.0.0
+
+# Database (SQLite is built into Python, no install needed)
+# Listed for explicitness — remove if your tool flags it as invalid
+# sqlite3  # stdlib
+
+# ML
+scikit-learn>=1.4.0
+
+# LLM providers
+groq>=0.9.0         # Groq API client (free tier)
+# ollama is accessed via HTTP — no separate package needed
+
+# API layer (Phase 8a — install now, use later)
+fastapi>=0.111.0
+uvicorn[standard]>=0.29.0
+
+# Dashboard (Phase 8b — install now, use later)
+streamlit>=1.35.0
+
+# Testing
+pytest>=8.2.0
+
+# HTTP (for Ollama fallback and future Razorpay calls)
+requests>=2.31.0
+httpx>=0.27.0
