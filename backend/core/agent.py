@@ -80,6 +80,7 @@ class MockProvider(LLMProvider):
         FailureReason.INVALID_OTP:             "authentication_timeout",
         FailureReason.INSUFFICIENT_FUNDS:      "insufficient_balance",
         FailureReason.CARD_EXPIRED:            "expired_payment_method",
+        FailureReason.INTERNATIONAL_CARD_UNSUPPORTED: "razorpay_alternate_method_active",
         FailureReason.CHECKOUT_ABANDONED:      "checkout_abandonment",
     }
 

@@ -153,6 +153,7 @@ export default function DashboardLayout({ children }: { children: React.ReactNod
     if (pathname === '/') return 'Overview';
     if (pathname === '/recovery-cases') return 'Recovery Cases';
     if (pathname === '/audit-trail') return 'Audit Trail';
+    if (pathname === '/ghost-revenue') return 'Ghost Revenue Hunter';
     return pathname.substring(1);
   };
 
@@ -203,10 +204,12 @@ export default function DashboardLayout({ children }: { children: React.ReactNod
             <NavItem icon={Home} label="Overview" href="/" />
             <NavItem icon={Briefcase} label="Recovery Cases" href="/recovery-cases" />
             <NavItem icon={List} label="Audit Trail" href="/audit-trail" />
+            <NavItem icon={Eye} label="Ghost Revenue Hunter" href="/ghost-revenue" />
             <NavItem icon={Users} label="Customers" href="/customers" />
             <NavItem icon={CreditCard} label="Payments" href="/payments" />
             <NavItem icon={BarChart2} label="Analytics" href="/analytics" />
             <div className="pt-2 pb-1">
+            <NavItem icon={Brain} label="Recovery Passport" href="/recovery-passport" />
               <p className="text-[10px] font-bold text-gray-400 uppercase tracking-widest px-3 mb-1">Automation</p>
             </div>
             <NavItem icon={Zap} label="Recovery assistant" href="/recover" accent={true} />

@@ -73,7 +73,66 @@ def route_playbook(
         channel = ChannelPreference.SMS
 
     # ──────────────────────────────────────────────────────────────────────────
+    # Razorpay already presented an alternate payment method (such as UPI).
+    # Monitor the gateway outcome; do not create a duplicate payment link.
+    # ──────────────────────────────────────────────────────────────────────────
+    if reason == FailureReason.INTERNATIONAL_CARD_UNSUPPORTED:
+        return PlaybookRoute(
+            strategy_type=StrategyType.RAZORPAY_FALLBACK_MONITORING,
+            recommended_action=RecoveryAction.WAIT_AND_RECHECK,
+            preferred_channel=channel,
+            playbook_name="RAZORPAY_FALLBACK_MONITORING",
+            diagnosis="razorpay_alternate_payment_active",
+            reason=(
+                "Razorpay has already offered the customer local alternatives such as UPI. "
+                "Monitoring the existing checkout instead of creating a duplicate recovery link."
+            ),
+            confidence=0.90,
+            delay_seconds=15,
+            requires_wait=True,
+            steps=[
+                RecoveryStep(
+                    step_number=1,
+                    action=RecoveryAction.WAIT_AND_RECHECK,
+                    channel=channel,
+                    delay_seconds=15,
+                    description="Monitor Razorpay's existing alternate-payment checkout without duplicate contact",
+                )
+            ],
+        )
+    # ──────────────────────────────────────────────────────────────────────────
     # 0. High-Value or Bounded Limit Check
+    # Native subscription retries are already owned by Razorpay.  This route is
+    # deliberately monitoring-only so the agent cannot create duplicate outreach.
+    if reason == FailureReason.SUBSCRIPTION_RETRY_ACTIVE:
+        return PlaybookRoute(
+            strategy_type=StrategyType.NATIVE_RETRY_MONITORING,
+            recommended_action=RecoveryAction.WAIT_AND_RECHECK,
+            preferred_channel=channel,
+            playbook_name="NATIVE_RETRY_MONITORING",
+            diagnosis="razorpay_subscription_retry_active",
+            reason="Razorpay is still retrying this subscription. RecoverAI will monitor the outcome and remain silent.",
+            confidence=0.96, delay_seconds=86400, requires_wait=True,
+            steps=[RecoveryStep(step_number=1, action=RecoveryAction.WAIT_AND_RECHECK, channel=channel, delay_seconds=86400, description="Wait for Razorpay native retry outcome; do not contact customer")],
+        )
+
+    # Once native retries are exhausted, ask for a commitment rather than sending
+    # a generic duplicate link.  The customer can choose a date or alternate method.
+    if reason in (FailureReason.SUBSCRIPTION_HALTED, FailureReason.INVOICE_OVERDUE):
+        return PlaybookRoute(
+            strategy_type=StrategyType.PROMISE_TO_PAY_RECOVERY,
+            recommended_action=RecoveryAction.REQUEST_PROMISE_TO_PAY,
+            preferred_channel=channel,
+            playbook_name="PROMISE_TO_PAY",
+            diagnosis="subscription_halted" if reason == FailureReason.SUBSCRIPTION_HALTED else "invoice_overdue",
+            reason="Native collection is exhausted or unavailable. Request one consent-based promise-to-pay before escalation.",
+            confidence=max(0.58, prob), delay_seconds=0, requires_wait=False,
+            steps=[
+                RecoveryStep(step_number=1, action=RecoveryAction.REQUEST_PROMISE_TO_PAY, channel=channel, description="Offer pay-now, alternate-method, or promise-to-pay-date choices"),
+                RecoveryStep(step_number=2, action=RecoveryAction.ESCALATE_TO_HUMAN, description="Escalate only if the commitment is missed or declined"),
+            ],
+        )
+
     # ──────────────────────────────────────────────────────────────────────────
     if amount > 10000.0 or prev_attempts >= 2:
         return PlaybookRoute(

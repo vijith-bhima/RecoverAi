@@ -311,8 +311,58 @@ CREATE TABLE IF NOT EXISTS scheduled_recovery_jobs (
 );
 """
 
+CREATE_PROMISE_TO_PAY = """
+CREATE TABLE IF NOT EXISTS promise_to_pay (
+    promise_id       TEXT PRIMARY KEY,
+    merchant_id      TEXT NOT NULL DEFAULT 'mer_default',
+    user_id          TEXT NOT NULL DEFAULT 'usr_default',
+    payment_id       TEXT NOT NULL,
+    amount           REAL NOT NULL CHECK (amount > 0),
+    promised_for     TEXT NOT NULL,
+    channel          TEXT NOT NULL DEFAULT 'SMS',
+    status           TEXT NOT NULL DEFAULT 'PROMISED',
+    customer_note    TEXT,
+    created_at       TEXT NOT NULL,
+    updated_at       TEXT NOT NULL,
+    fulfilled_at     TEXT,
+    FOREIGN KEY (payment_id) REFERENCES payments(payment_id),
+    FOREIGN KEY (merchant_id) REFERENCES merchants(merchant_id)
+);
+"""
+
+
+CREATE_GHOST_REVENUE_INCIDENTS = """
+CREATE TABLE IF NOT EXISTS ghost_revenue_incidents (
+    incident_id          TEXT PRIMARY KEY,
+    merchant_id          TEXT NOT NULL DEFAULT 'mer_default',
+    razorpay_payment_id  TEXT NOT NULL,
+    amount               REAL NOT NULL CHECK (amount > 0),
+    issue_type           TEXT NOT NULL,
+    status               TEXT NOT NULL DEFAULT 'OPEN',
+    recommended_action   TEXT NOT NULL,
+    evidence_json        TEXT NOT NULL DEFAULT '{}',
+    created_at           TEXT NOT NULL,
+    resolved_at          TEXT,
+    resolution_note      TEXT,
+    UNIQUE (merchant_id, razorpay_payment_id, issue_type),
+    FOREIGN KEY (merchant_id) REFERENCES merchants(merchant_id)
+);
+"""
+CREATE_GHOST_REVENUE_EVENTS = """
+CREATE TABLE IF NOT EXISTS ghost_revenue_events (
+    event_id             TEXT PRIMARY KEY,
+    incident_id          TEXT NOT NULL,
+    merchant_id          TEXT NOT NULL,
+    event_type           TEXT NOT NULL,
+    detail_json          TEXT NOT NULL DEFAULT '{}',
+    created_at           TEXT NOT NULL,
+    UNIQUE (incident_id, event_type),
+    FOREIGN KEY (incident_id) REFERENCES ghost_revenue_incidents(incident_id),
+    FOREIGN KEY (merchant_id) REFERENCES merchants(merchant_id)
+);
+"""
+
 CREATE_INDEXES = [
-    "CREATE INDEX IF NOT EXISTS idx_merchants_name       ON merchants(name);",
     "CREATE INDEX IF NOT EXISTS idx_password_resets_user ON password_reset_tokens(user_id, expires_at);",
     "CREATE INDEX IF NOT EXISTS idx_users_email          ON users(email);",
     "CREATE INDEX IF NOT EXISTS idx_users_merchant       ON users(merchant_id);",
@@ -358,7 +408,10 @@ def init_db() -> None:
         conn.execute(CREATE_RECOVERY_PLANS)
         conn.execute(CREATE_RECOVERY_ATTEMPTS)
         conn.execute(CREATE_AUDIT_LOGS)
+        conn.execute(CREATE_GHOST_REVENUE_INCIDENTS)
+        conn.execute(CREATE_GHOST_REVENUE_EVENTS)
         conn.execute(CREATE_GROUND_TRUTH)
+        conn.execute(CREATE_PROMISE_TO_PAY)
         conn.execute(CREATE_SETTINGS)
         conn.execute(CREATE_SCHEDULED_RECOVERY_JOBS)
 
@@ -456,6 +509,10 @@ def _safe_migrate() -> None:
             conn.execute("ALTER TABLE audit_logs ADD COLUMN strategy_type TEXT DEFAULT 'INTELLIGENT_RETRY'")
         if "channel_used" not in audit_cols:
             conn.execute("ALTER TABLE audit_logs ADD COLUMN channel_used TEXT DEFAULT 'SMS'")
+
+        ghost_cols = [row[1] for row in conn.execute("PRAGMA table_info(ghost_revenue_incidents)").fetchall()]
+        if "resolution_note" not in ghost_cols:
+            conn.execute("ALTER TABLE ghost_revenue_incidents ADD COLUMN resolution_note TEXT")
 
         # merchant_settings table check and compound primary key migration
         try:
@@ -1133,6 +1190,69 @@ def fetch_scheduled_job(payment_id: str, merchant_id: Optional[str] = None) -> s
 
 
 # Ensure DB schema and migrations are initialized on module load
+
+def record_ghost_revenue_incident(incident_id: str, merchant_id: str, razorpay_payment_id: str, amount: float, issue_type: str, recommended_action: str, evidence: dict) -> None:
+    now = datetime.now(timezone.utc).isoformat()
+    with get_connection() as conn:
+        conn.execute("""INSERT OR IGNORE INTO ghost_revenue_incidents
+        (incident_id, merchant_id, razorpay_payment_id, amount, issue_type, recommended_action, evidence_json, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)""", (incident_id, merchant_id, razorpay_payment_id, amount, issue_type, recommended_action, json.dumps(evidence), now))
+
+
+def fetch_ghost_revenue_incidents(merchant_id: str, limit: int = 100) -> list[dict]:
+    with get_connection() as conn:
+        rows = conn.execute("SELECT * FROM ghost_revenue_incidents WHERE merchant_id = ? ORDER BY created_at DESC LIMIT ?", (merchant_id, limit)).fetchall()
+    return [dict(row) for row in rows]
+
+
+def resolve_ghost_revenue_incident(incident_id: str, merchant_id: str, resolution: str) -> bool:
+    with get_connection() as conn:
+        existing = conn.execute("SELECT incident_id FROM ghost_revenue_incidents WHERE incident_id = ? AND merchant_id = ?", (incident_id, merchant_id)).fetchone()
+        if not existing:
+            return False
+        conn.execute("UPDATE ghost_revenue_incidents SET status = ?, resolved_at = ? WHERE incident_id = ? AND merchant_id = ?", (resolution, datetime.now(timezone.utc).isoformat(), incident_id, merchant_id))
+    return True
+
+def record_ghost_revenue_event(event_id: str, incident_id: str, merchant_id: str, event_type: str, detail: dict) -> None:
+    """Persist idempotent, tenant-owned Ghost Revenue detection/resolution activity."""
+    with get_connection() as conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO ghost_revenue_events (event_id, incident_id, merchant_id, event_type, detail_json, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (event_id, incident_id, merchant_id, event_type, json.dumps(detail), datetime.now(timezone.utc).isoformat()),
+        )
+
+
+def create_promise_to_pay(
+    promise_id: str, payment_id: str, amount: float, promised_for: str,
+    channel: str, merchant_id: str, user_id: str, customer_note: str = "",
+) -> dict:
+    now = datetime.now(timezone.utc).isoformat()
+    with get_connection() as conn:
+        conn.execute(
+            """INSERT INTO promise_to_pay
+            (promise_id, merchant_id, user_id, payment_id, amount, promised_for, channel, status, customer_note, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'PROMISED', ?, ?, ?)""",
+            (promise_id, merchant_id, user_id, payment_id, amount, promised_for, channel, customer_note, now, now),
+        )
+    return fetch_promise_to_pay(payment_id, merchant_id) or {}
+
+
+def fetch_promise_to_pay(payment_id: str, merchant_id: str) -> dict | None:
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM promise_to_pay WHERE payment_id = ? AND merchant_id = ? ORDER BY created_at DESC LIMIT 1",
+            (payment_id, merchant_id),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def update_promise_to_pay(payment_id: str, merchant_id: str, status: str) -> None:
+    now = datetime.now(timezone.utc).isoformat()
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE promise_to_pay SET status = ?, updated_at = ?, fulfilled_at = CASE WHEN ? = 'KEPT' THEN ? ELSE fulfilled_at END WHERE payment_id = ? AND merchant_id = ?",
+            (status, now, status, now, payment_id, merchant_id),
+        )
 try:
     init_db()
 except Exception as e:

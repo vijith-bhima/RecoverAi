@@ -61,6 +61,11 @@ _REASON_CONFIG: dict[FailureReason, dict] = {
         "is_recoverable": True,
         "base_prob":      0.22,
         "notes":          "Card is expired — retry useless; only a payment-link with method choice can recover.",
+    },    FailureReason.INTERNATIONAL_CARD_UNSUPPORTED: {
+        "is_temporary":   False,
+        "is_recoverable": True,
+        "base_prob":      0.70,
+        "notes":          "Razorpay already offered local payment methods; monitor that fallback before contacting the customer.",
     },
     FailureReason.CHECKOUT_ABANDONED: {
         "is_temporary":   False,
@@ -68,8 +73,20 @@ _REASON_CONFIG: dict[FailureReason, dict] = {
         "base_prob":      0.65,
         "notes":          "Customer dropped off during checkout; gentle reminder link can recover conversion.",
     },
-}
 
+    FailureReason.SUBSCRIPTION_RETRY_ACTIVE: {
+        "is_temporary": False, "is_recoverable": True, "base_prob": 0.72,
+        "notes": "Razorpay native subscription retry is active; monitor without customer outreach.",
+    },
+    FailureReason.SUBSCRIPTION_HALTED: {
+        "is_temporary": False, "is_recoverable": True, "base_prob": 0.58,
+        "notes": "Native subscription retries are exhausted; offer a consent-based recovery choice.",
+    },
+    FailureReason.INVOICE_OVERDUE: {
+        "is_temporary": False, "is_recoverable": True, "base_prob": 0.62,
+        "notes": "Invoice is overdue; a promise-to-pay commitment is preferable to repeated link reminders.",
+    },
+}
 # ── Adjustment weights ─────────────────────────────────────────────────────────
 
 LOYALTY_WEIGHT    = 0.20   # bonus for customers with high success rate

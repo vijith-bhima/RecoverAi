@@ -49,6 +49,7 @@ _ACTION_MESSAGES: dict[RecoveryAction, str] = {
     RecoveryAction.WAIT:                     "Payment queued for re-evaluation in accordance with recovery plan.",
     RecoveryAction.WAIT_AND_RECHECK:         "Payment queued for cooldown and automatic gateway recheck.",
     RecoveryAction.RECHECK_STATUS:           "Gateway status rechecked to confirm live transaction outcome.",
+    RecoveryAction.REQUEST_PROMISE_TO_PAY:    "Promise-to-pay request recorded; awaiting customer commitment.",
     RecoveryAction.STOP:                     "No further recovery action — case closed.",
 }
 
@@ -215,6 +216,9 @@ def execute_action(
             outcome_reason = "Gateway retry dispatched. Awaiting transaction outcome from processor."
         elif action == RecoveryAction.ESCALATE_TO_HUMAN:
             outcome = AttemptStatus.PENDING
+        elif action == RecoveryAction.REQUEST_PROMISE_TO_PAY:
+            outcome = AttemptStatus.PENDING
+            outcome_reason = "Promise-to-pay requested. Awaiting customer-selected payment date or alternate method."
             outcome_reason = f"Escalated to human review queue: {guardrail_result.reason or 'Limit reached'}."
         elif action == RecoveryAction.STOP:
             outcome = AttemptStatus.FAILED

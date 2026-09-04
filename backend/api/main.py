@@ -67,6 +67,10 @@ from db import (
     fetch_recovery_plan,
     save_recovery_plan,
     fetch_merchant_by_id,
+    record_ghost_revenue_incident,
+    fetch_ghost_revenue_incidents,
+    resolve_ghost_revenue_incident,
+    record_ghost_revenue_event,
     fetch_all_merchants,
     update_merchant,
 )
@@ -562,6 +566,18 @@ def _process_due_scheduled_jobs() -> int:
             processed_count += 1
             continue
 
+        # Razorpay is already presenting alternate methods in its own checkout.
+        # Mark the case as monitored and wait for a captured-payment webhook;
+        # creating another link here would duplicate the customer's recovery path.
+        if payment.failure_reason == FailureReason.INTERNATIONAL_CARD_UNSUPPORTED:
+            _log_event("razorpay_fallback_monitoring", merchant_id=job_mid, user_id=job_user_id,
+                payment_id=payment_id, amount=payment.amount,
+                label="👀 Monitoring Razorpay alternate-payment checkout",
+                sublabel="UPI / local alternatives are already available; no duplicate payment link was sent")
+            update_job_stage(job_id, stage="RAZORPAY_FALLBACK_MONITORING", status="COMPLETED", recheck_result="MONITORING_RAZORPAY_FALLBACK")
+            processed_count += 1
+            continue
+
         # ── Second Decision & Safety Guardrail Check ───────────────────────────
         score = score_recovery(payment, customer)
         action_to_take = RecoveryAction.SEND_PAYMENT_LINK
@@ -958,6 +974,7 @@ class PaymentEventRequest(BaseModel):
 
 
 class PipelineResponse(BaseModel):
+
     """Full pipeline result returned by POST /recovery/run/{payment_id}."""
     payment_id:         str
     recovery_score:     RecoveryScore
@@ -967,6 +984,13 @@ class PipelineResponse(BaseModel):
     audit_event_id:     str
 
 
+
+class PromiseToPayRequest(BaseModel):
+    """A customer-approved commitment captured by the recovery agent."""
+    payment_id: str
+    promised_for: datetime
+    channel: ChannelPreference = ChannelPreference.SMS
+    customer_note: str = Field(default="", max_length=500)
 from typing import List, Dict, Any, Optional
 
 class CheckoutEventRequest(BaseModel):
@@ -1813,7 +1837,9 @@ async def razorpay_webhook(request: Request, background_tasks: BackgroundTasks):
             error_step   = str(entity.get("error_step") or "").lower()
             combined_err = f"{error_code} {error_desc} {error_reason} {error_step}"
 
-            if any(k in combined_err for k in ("insufficient", "fund", "balance", "limit", "low_balance")):
+            if any(k in combined_err for k in ("international", "not supported", "international card")):
+                internal_reason = FailureReason.INTERNATIONAL_CARD_UNSUPPORTED
+            elif any(k in combined_err for k in ("insufficient", "fund", "balance", "limit", "low_balance")):
                 internal_reason = FailureReason.INSUFFICIENT_FUNDS
             elif any(k in combined_err for k in ("expired", "expir", "validity")):
                 internal_reason = FailureReason.CARD_EXPIRED
@@ -1908,11 +1934,12 @@ async def razorpay_webhook(request: Request, background_tasks: BackgroundTasks):
                 if not recovered_payment_id:
                     row = conn.execute("""
                         SELECT p.payment_id, p.merchant_id FROM payments p
-                        JOIN recovery_attempts ra ON ra.payment_id = p.payment_id
+                        LEFT JOIN recovery_attempts ra ON ra.payment_id = p.payment_id
                         WHERE p.status = 'FAILED' AND p.merchant_id = ?
                           AND ABS(p.amount - ?) < 1.0
+                          AND (ra.attempt_id IS NOT NULL OR p.failure_reason = ?)
                         ORDER BY p.timestamp DESC LIMIT 1
-                    """, (target_merchant_id, amount)).fetchone()
+                    """, (target_merchant_id, amount, FailureReason.INTERNATIONAL_CARD_UNSUPPORTED.value)).fetchone()
                     if row:
                         recovered_payment_id = row["payment_id"]
                         matched_mid = row["merchant_id"]
@@ -1955,7 +1982,28 @@ async def razorpay_webhook(request: Request, background_tasks: BackgroundTasks):
                         "captured_payment_id": captured_pay_id, "amount_inr": amount}
             else:
                 logger.warning(f"webhook.captured.no_match: {captured_pay_id} amount=₹{amount}")
-                return {"status": "ignored", "reason": "Could not match to a failed payment"}
+                issue_type = "CAPTURED_WITHOUT_MERCHANT_ORDER"
+                incident_id = "ghost_" + hashlib.sha256(
+                    f"{target_merchant_id}:{captured_pay_id}:{issue_type}".encode()
+                ).hexdigest()[:20]
+                evidence = {
+                    "razorpay_event": event,
+                    "razorpay_payment_status": pay_entity.get("status", "captured"),
+                    "reference_id": reference_id or None,
+                    "match_result": "No tenant-scoped failed payment or recovery attempt matched",
+                }
+                record_ghost_revenue_incident(incident_id, target_merchant_id, captured_pay_id, amount,
+                    issue_type, "CREATE_OR_VERIFY_ORDER", evidence)
+                record_ghost_revenue_event(f"evt_{incident_id}_detected", incident_id, target_merchant_id,
+                    "ghost_revenue_detected", evidence)
+                _log_event("ghost_revenue_detected", merchant_id=target_merchant_id, user_id=target_user_id,
+                    payment_id=captured_pay_id, amount=amount,
+                    label="Ghost Revenue detected: captured payment needs reconciliation",
+                    sublabel="Razorpay confirms payment; no new charge or payment link will be created.")
+                logger.warning(f"webhook.captured.no_match: {captured_pay_id} incident={incident_id}")
+                return {"status": "ghost_revenue_detected", "incident_id": incident_id,
+                        "merchant_id": target_merchant_id, "captured_payment_id": captured_pay_id,
+                        "recommended_action": "CREATE_OR_VERIFY_ORDER"}
 
         except KeyError as e:
             raise HTTPException(status_code=400, detail=f"Malformed {event} payload: missing {e}")
@@ -2033,6 +2081,58 @@ def run_recovery_pipeline(payment_id: str, request: Request):
         audit_event_id=audit.event_id,
     )
 
+
+class GhostRevenueResolutionRequest(BaseModel):
+    resolution: str = Field(description="ORDER_VERIFIED_RESTORED | ESCALATED_FOR_REVIEW")
+    note: str = Field(default="", max_length=500)
+
+
+@app.get("/ghost-revenue/incidents", tags=["Ghost Revenue Hunter"])
+def list_ghost_revenue_incidents(request: Request, limit: int = 100):
+    """List captured Razorpay payments that require an explicit merchant reconciliation."""
+    user = get_current_user_context(request)
+    incidents = fetch_ghost_revenue_incidents(user["merchant_id"], min(max(limit, 1), 200))
+    for incident in incidents:
+        try:
+            incident["evidence"] = json.loads(incident.pop("evidence_json", "{}"))
+        except json.JSONDecodeError:
+            incident["evidence"] = {}
+    unreconciled_amount = sum(float(i["amount"]) for i in incidents if i["status"] == "OPEN")
+    return {"incidents": incidents, "total_captured_unreconciled_amount": unreconciled_amount,
+            "safety_policy": "Captured payments are reconciled explicitly; RecoverAI never creates a link or charge for them."}
+
+
+@app.post("/ghost-revenue/incidents/{incident_id}/resolve", tags=["Ghost Revenue Hunter"])
+def resolve_ghost_revenue(incident_id: str, body: GhostRevenueResolutionRequest, request: Request):
+    """Record a bounded human reconciliation outcome; no external order or payment action is performed."""
+    if body.resolution not in {"ORDER_VERIFIED_RESTORED", "ESCALATED_FOR_REVIEW"}:
+        raise HTTPException(status_code=422, detail="resolution must be ORDER_VERIFIED_RESTORED or ESCALATED_FOR_REVIEW")
+    user = get_current_user_context(request)
+    merchant_id = user["merchant_id"]
+    if not resolve_ghost_revenue_incident(incident_id, merchant_id, body.resolution):
+        raise HTTPException(status_code=404, detail="Ghost Revenue incident not found in your workspace.")
+    detail = {"resolution": body.resolution, "note": body.note, "resolved_by": user["user_id"]}
+    record_ghost_revenue_event(f"evt_{incident_id}_{body.resolution.lower()}", incident_id, merchant_id,
+                               "ghost_revenue_resolved", detail)
+    _log_event("ghost_revenue_resolved", merchant_id=merchant_id, user_id=user["user_id"],
+               payment_id=incident_id, amount=0,
+               label="Ghost Revenue reconciliation recorded",
+               sublabel=f"{body.resolution.replace('_', ' ').title()}. No payment link or charge was created.")
+    return {"status": body.resolution, "incident_id": incident_id,
+            "message": "Resolution recorded. RecoverAI did not create an external order, link, retry, or charge."}
+
+
+@app.post("/ghost-revenue/demo-incident", tags=["Ghost Revenue Hunter"])
+def create_ghost_revenue_demo_incident(request: Request):
+    """Create a synthetic, non-Razorpay incident for a safe product demonstration."""
+    user = get_current_user_context(request)
+    merchant_id = user["merchant_id"]
+    incident_id = "ghost_demo_" + hashlib.sha256(merchant_id.encode()).hexdigest()[:16]
+    evidence = {"source": "safe_demo", "razorpay_payment_status": "captured", "note": "Synthetic incident only; no Razorpay API call was made."}
+    record_ghost_revenue_incident(incident_id, merchant_id, "pay_demo_captured_unreconciled", 1250.0,
+                                  "CAPTURED_WITHOUT_MERCHANT_ORDER", "CREATE_OR_VERIFY_ORDER", evidence)
+    record_ghost_revenue_event(f"evt_{incident_id}_detected", incident_id, merchant_id, "ghost_revenue_detected", evidence)
+    return {"incident_id": incident_id, "status": "ghost_revenue_detected", "synthetic": True}
 
 @app.get("/audit", tags=["Audit"])
 def list_audit_logs(request: Request, limit: int = 100):
@@ -2230,6 +2330,56 @@ def get_escalated_cases(request: Request):
 
 
 @app.get("/recovery/plan/{payment_id}", tags=["Recovery"])
+
+@app.get("/recovery/passport/{payment_id}", tags=["Recovery Passport"])
+def get_recovery_passport(payment_id: str, request: Request):
+    """Explain why a case is eligible, suppressed, or escalated before outreach."""
+    from core.recovery_passport import build_recovery_passport
+    from db import fetch_promise_to_pay
+    user = get_current_user_context(request)
+    merchant_id = user["merchant_id"]
+    row = fetch_payment(payment_id, merchant_id=merchant_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Payment not found")
+    customer_row = fetch_customer(row["customer_id"], merchant_id=merchant_id)
+    payment = Payment(payment_id=row["payment_id"], customer_id=row["customer_id"], amount=row["amount"], status=PaymentStatus(row["status"]), failure_reason=FailureReason(row["failure_reason"]), payment_method=PaymentMethod(row["payment_method"]), timestamp=datetime.fromisoformat(row["timestamp"]), previous_attempts=row["previous_attempts"], event_type=EventType(row["event_type"]) if row["event_type"] else EventType.PAYMENT_FAILED)
+    customer = Customer(customer_id=row["customer_id"], total_payments=customer_row["total_payments"] if customer_row else 0, successful_payments=customer_row["successful_payments"] if customer_row else 0, failed_payments=customer_row["failed_payments"] if customer_row else 0, lifetime_value=(customer_row["lifetime_value"] or 0.0) if customer_row else 0.0, preferred_channel=ChannelPreference(customer_row["preferred_channel"] or "SMS") if customer_row else ChannelPreference.SMS)
+    return build_recovery_passport(payment, score_recovery(payment, customer), customer, fetch_promise_to_pay(payment_id, merchant_id))
+
+
+@app.post("/recovery/promise-to-pay", tags=["Promise to Pay"])
+def capture_promise_to_pay(body: PromiseToPayRequest, request: Request):
+    """Capture a customer-approved date; no payment charge or duplicate link is created."""
+    from uuid import uuid4
+    from db import create_promise_to_pay
+    user = get_current_user_context(request)
+    merchant_id, user_id = user["merchant_id"], user["user_id"]
+    if body.promised_for <= datetime.now(timezone.utc):
+        raise HTTPException(status_code=422, detail="promised_for must be in the future")
+    if body.promised_for > datetime.now(timezone.utc) + timedelta(days=90):
+        raise HTTPException(status_code=422, detail="promise date must be within 90 days")
+    row = fetch_payment(body.payment_id, merchant_id=merchant_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Payment not found")
+    if row["failure_reason"] not in (FailureReason.SUBSCRIPTION_HALTED.value, FailureReason.INVOICE_OVERDUE.value):
+        raise HTTPException(status_code=409, detail="Promise-to-Pay is available only after native subscription recovery is exhausted or for overdue invoices")
+    promise = create_promise_to_pay(f"ptp_{uuid4().hex[:12]}", body.payment_id, float(row["amount"]), body.promised_for.isoformat(), body.channel.value, merchant_id, user_id, body.customer_note)
+    _log_event("promise_to_pay_captured", merchant_id=merchant_id, user_id=user_id, payment_id=body.payment_id, amount=float(row["amount"]), label="🤝 Promise-to-Pay captured", sublabel=f"Customer committed to pay by {body.promised_for.date().isoformat()} via {body.channel.value}")
+    return {"status": "PROMISED", "promise": promise, "message": "Commitment recorded. A single follow-up may be scheduled; no duplicate payment link was sent."}
+
+
+@app.get("/recovery/impact", tags=["Recovery Passport"])
+def recovery_impact(request: Request):
+    """Counterfactual-style attribution: native recovery is never counted as RecoverAI recovery."""
+    user = get_current_user_context(request)
+    merchant_id = user["merchant_id"]
+    native = (FailureReason.INTERNATIONAL_CARD_UNSUPPORTED.value, FailureReason.SUBSCRIPTION_RETRY_ACTIVE.value)
+    with get_connection() as conn:
+        at_risk = conn.execute("SELECT COUNT(*) AS cases, COALESCE(SUM(amount), 0) AS value FROM payments WHERE merchant_id = ?", (merchant_id,)).fetchone()
+        native_rows = conn.execute("SELECT COUNT(*) AS cases, COALESCE(SUM(amount), 0) AS value FROM payments WHERE merchant_id = ? AND failure_reason IN (?, ?)", (merchant_id, *native)).fetchone()
+        recovered = conn.execute("SELECT COUNT(DISTINCT p.payment_id) AS cases, COALESCE(SUM(DISTINCT p.amount), 0) AS value FROM payments p WHERE p.merchant_id = ? AND p.status = 'RECOVERED' AND p.failure_reason NOT IN (?, ?)", (merchant_id, *native)).fetchone()
+        promises = conn.execute("SELECT COUNT(*) AS cases, COALESCE(SUM(amount), 0) AS value FROM promise_to_pay WHERE merchant_id = ? AND status = 'PROMISED'", (merchant_id,)).fetchone()
+    return {"at_risk": dict(at_risk), "razorpay_native_monitored": dict(native_rows), "recoverai_incremental_verified": dict(recovered), "open_promises_to_pay": dict(promises), "attribution_policy": "Native Razorpay paths are excluded from RecoverAI recovered revenue."}
 def get_payment_recovery_plan(payment_id: str, request: Request):
     """
     Retrieve or generate the structured multi-step Recovery Plan for any payment within the active merchant's workspace.
@@ -3198,7 +3348,9 @@ def sync_recent_razorpay_failures(request: Request, background_tasks: Background
                             err_code = str(item.get("error_code") or "").lower()
                             err_reason = str(item.get("error_reason") or "").lower()
 
-                            if any(k in err_desc or k in err_code for k in ("card", "international", "decline", "not supported")):
+                            if any(k in err_desc or k in err_code for k in ("international", "not supported")):
+                                reason = FailureReason.INTERNATIONAL_CARD_UNSUPPORTED
+                            elif any(k in err_desc or k in err_code for k in ("card", "decline")):
                                 reason = FailureReason.CARD_EXPIRED
                             elif any(k in err_desc or k in err_code for k in ("insufficient", "balance", "fund")):
                                 reason = FailureReason.INSUFFICIENT_FUNDS
