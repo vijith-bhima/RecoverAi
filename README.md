@@ -761,7 +761,7 @@ To maintain absolute engineering integrity, the following current limitations ar
 
 ### Step 1: Clone Repository
 ```bash
-git clone https://github.com/your-username/RecoverAi.git
+git clone https://github.com/vijith-bhima/RecoverAi.git
 cd RecoverAi
 ```
 
