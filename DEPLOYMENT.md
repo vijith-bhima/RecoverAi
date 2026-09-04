@@ -38,7 +38,7 @@ APP_BASE_URL=https://app.example.com
 CORS_ORIGINS=https://app.example.com
 ```
 
-Launch the full stack (FastAPI Backend + Next.js Frontend + SQLite with Volume Persistence):
+Launch the full stack (FastAPI Backend + Next.js Frontend + PostgreSQL with persistent volume):
 
 ```bash
 docker compose up --build -d

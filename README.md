@@ -87,7 +87,7 @@ $$\text{ML Predicts} \longrightarrow \text{AI Reasons} \longrightarrow \text{Rul
 * **AI Reasons:** LLM parses failure taxonomy, customer lifetime value (LTV), and previous retry attempts to generate structured, multi-step recovery execution plans.
 * **Rules Protect:** Deterministic guardrail engine evaluates hard financial boundaries (amount ceilings, retry limits, cooldown windows, fraud tripwires) and overrides unsafe AI suggestions.
 * **Code Executes:** Strongly-typed Python execution services interact with Razorpay APIs to generate payment links, dispatch multi-channel alerts, and trigger status checks.
-* **Database Remembers:** SQLite/WAL engine maintains tenant-isolated payment states, idempotency keys, structured recovery plans, and tamper-evident audit logs.
+* **Database Remembers:** PostgreSQL (with SQLite/WAL retained for local development) maintains tenant-isolated payment states, idempotency keys, structured recovery plans, and tamper-evident audit logs.
 
 > [!IMPORTANT]
 > **Financial Execution Fence:** The Large Language Model (LLM) **never** executes financial transactions or charges directly. All recovery operations are strictly bounded by deterministic Python guardrails.
@@ -159,7 +159,7 @@ flowchart TB
         Core_Audit["Tamper-Proof Audit Logger (core/audit.py)"]
     end
 
-    subgraph StorageLayer["Persistence & Infrastructure (SQLite WAL / External Gateway)"]
+    subgraph StorageLayer["Persistence & Infrastructure (PostgreSQL / External Gateway)"]
         DB_Tenant["Tenant Isolation (merchants, users, settings)"]
         DB_Core["Core Tables (payments, customers, recovery_plans)"]
         DB_Audit["Audit & Ground Truth (audit_logs, ground_truth)"]
@@ -723,7 +723,7 @@ RecoverAI/
 To maintain absolute engineering integrity, the following current limitations are explicitly documented:
 1. **Single-Process Revocation:** JWT token revocation is currently maintained in-memory in `core/auth.py`. Multi-replica production deployments require a shared Redis token store.
 2. **Channel Integration:** SMS and Email dispatch are integrated with Razorpay's notification engine. WhatsApp Business API integration is architected in schemas but requires a registered Meta Business Account.
-3. **Database Engine:** Currently uses SQLite WAL mode for zero-setup execution. A production migration to PostgreSQL is planned for high-scale enterprise workloads.
+3. **Database Engine:** Currently uses SQLite WAL mode for zero-setup execution. PostgreSQL is supported for production deployments; SQLite/WAL remains available for local development.
 4. **Live Gateway Settlements:** While payment link creation and status rechecks are live via Razorpay, real customer fund capture depends on actual cardholder settlement.
 
 ---
@@ -741,7 +741,7 @@ To maintain absolute engineering integrity, the following current limitations ar
 - [x] 47 automated unit, pipeline, and security tests.
 
 ### Planned (Future Work) 🚀
-- [ ] PostgreSQL migration script with Alembic migrations.
+- [x] PostgreSQL baseline schema migration and runtime database compatibility.
 - [ ] Distributed Celery / Redis worker architecture for high-volume queue draining.
 - [ ] WhatsApp Business Cloud API direct template messaging.
 - [ ] Multi-gateway failover routing (e.g. Razorpay $\rightarrow$ Cashfree / PayU fallback).

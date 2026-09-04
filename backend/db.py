@@ -9,6 +9,7 @@ and merchant workspace profiles.
 
 import json
 import os
+import re
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -22,22 +23,71 @@ load_dotenv()
 
 logger = get_logger(__name__)
 
-# Read DB path from env, fall back to local file
-DATABASE_PATH: str = os.getenv("DATABASE_URL", "recoverai.db")
+# DATABASE_URL accepts either a SQLite path or a PostgreSQL connection URL.
+DATABASE_URL: str = os.getenv("DATABASE_URL", "recoverai.db")
+DATABASE_PATH = DATABASE_URL  # Backwards-compatible name used by log messages.
+IS_POSTGRES = DATABASE_URL.startswith(("postgres://", "postgresql://"))
+
+
+class PostgresRow(dict):
+    """Mapping row with SQLite-compatible positional access."""
+    def __getitem__(self, key):
+        return list(self.values())[key] if isinstance(key, int) else super().__getitem__(key)
+
+
+def _postgres_sql(sql: str) -> str:
+    """Translate the small SQLite SQL dialect used by the application."""
+    is_ignore = bool(re.search(r"INSERT\s+OR\s+IGNORE", sql, flags=re.IGNORECASE))
+    replace = re.search(r"INSERT\s+OR\s+REPLACE\s+INTO\s+([\w.]+)\s*\(([^)]+)\)", sql, flags=re.IGNORECASE | re.DOTALL)
+    if replace:
+        table, columns = replace.groups()
+        assignments = ", ".join(f"{column.strip()} = EXCLUDED.{column.strip()}" for column in columns.split(","))
+        sql = sql[:replace.start()] + f"INSERT INTO {table} ({columns})" + sql[replace.end():]
+        sql = sql.rstrip().rstrip(";") + f" ON CONFLICT DO UPDATE SET {assignments}"
+    elif is_ignore:
+        sql = re.sub(r"INSERT\s+OR\s+IGNORE", "INSERT", sql, flags=re.IGNORECASE)
+        sql = sql.rstrip().rstrip(";") + " ON CONFLICT DO NOTHING"
+    return re.sub(r":([A-Za-z_]\w*)", r"%(\1)s", sql).replace("?", "%s")
+
+
+class PostgresCursor:
+    def __init__(self, cursor): self._cursor = cursor
+    def fetchone(self):
+        row = self._cursor.fetchone()
+        return PostgresRow(row) if row is not None else None
+    def fetchall(self): return [PostgresRow(row) for row in self._cursor.fetchall()]
+
+
+class PostgresConnection:
+    """Minimal sqlite3-compatible facade over a psycopg connection."""
+    def __init__(self, connection): self._connection = connection
+    def execute(self, sql: str, params=None): return PostgresCursor(self._connection.execute(_postgres_sql(sql), params))
+    def executemany(self, sql: str, params):
+        cursor = self._connection.cursor()
+        cursor.executemany(_postgres_sql(sql), params)
+        return PostgresCursor(cursor)
+    def commit(self): self._connection.commit()
+    def rollback(self): self._connection.rollback()
+    def close(self): self._connection.close()
 
 
 # ── Connection helper ─────────────────────────────────────────────────────────
 
 @contextmanager
-def get_connection() -> Generator[sqlite3.Connection, None, None]:
-    """
-    Context manager for database connections.
-    Commits on success, rolls back on error, ensures clean connection closure.
-    """
-    conn = sqlite3.connect(DATABASE_PATH, timeout=30.0)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")   # better concurrent reads
-    conn.execute("PRAGMA foreign_keys=ON")    # enforce FK constraints
+def get_connection() -> Generator[Any, None, None]:
+    """Open a SQLite or PostgreSQL connection and commit atomically on success."""
+    if IS_POSTGRES:
+        try:
+            import psycopg
+            from psycopg.rows import dict_row
+        except ImportError as exc:
+            raise RuntimeError("PostgreSQL DATABASE_URL requires psycopg; install backend requirements first.") from exc
+        conn = PostgresConnection(psycopg.connect(DATABASE_URL, row_factory=dict_row))
+    else:
+        conn = sqlite3.connect(DATABASE_PATH, timeout=30.0)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA foreign_keys=ON")
     try:
         yield conn
         conn.commit()
@@ -299,7 +349,8 @@ def init_db() -> None:
         conn.execute(CREATE_SETTINGS)
         conn.execute(CREATE_SCHEDULED_RECOVERY_JOBS)
 
-    _safe_migrate()
+    if not IS_POSTGRES:
+        _safe_migrate()
 
     with get_connection() as conn:
         for idx_sql in CREATE_INDEXES:

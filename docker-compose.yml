@@ -1,4 +1,20 @@
 services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: recoverai-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-recoverai}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB:-recoverai}
+    volumes:
+      - recoverai-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
   backend:
     build:
       context: ./backend
@@ -7,10 +23,11 @@ services:
     restart: unless-stopped
     ports:
       - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
     environment:
-      # Keep mutable SQLite data outside the application directory. Mounting a
-      # volume at /app would otherwise hide the image's source files at runtime.
-      - DATABASE_URL=/app/data/recoverai.db
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-recoverai}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-recoverai}
       - LLM_PROVIDER=groq
       - GROQ_API_KEY=${GROQ_API_KEY}
       - GROQ_MODEL=${GROQ_MODEL:-llama-3.1-8b-instant}
@@ -27,9 +44,7 @@ services:
       - SMTP_FROM=${SMTP_FROM:-}
       - SMTP_USERNAME=${SMTP_USERNAME:-}
       - SMTP_PASSWORD=${SMTP_PASSWORD:-}
-      - LOG_FILE=/app/data/recoverai.log
-    volumes:
-      - recoverai-data:/app/data
+      - LOG_FILE=/tmp/recoverai.log
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/readyz"]
       interval: 30s
@@ -45,12 +60,10 @@ services:
     ports:
       - "3000:3000"
     environment:
-      # This URL is used by the user's browser, so it must resolve from the
-      # host machine rather than only inside the Docker network.
       - NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL:-http://localhost:8000}
     depends_on:
       backend:
         condition: service_healthy
 
 volumes:
-  recoverai-data:
+  recoverai-postgres-data:
