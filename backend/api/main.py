@@ -1600,7 +1600,17 @@ def _run_recovery_for_payment(payment_id: str, customer_email: str = "", custome
             created_at=now,
         )
         try:
-            save_recovery_plan(plan, merchant_id=row_mid)
+            save_recovery_plan(
+                plan_id=plan.plan_id,
+                payment_id=plan.payment_id,
+                strategy=plan.strategy.value if hasattr(plan.strategy, "value") else str(plan.strategy),
+                steps=[step.model_dump() if hasattr(step, "model_dump") else step for step in plan.steps],
+                priority=plan.priority.value if hasattr(plan.priority, "value") else str(plan.priority),
+                expected_recovery_value=plan.expected_recovery_value,
+                created_at=plan.created_at.isoformat(),
+                merchant_id=row_mid,
+                user_id=row_uid,
+            )
         except Exception as e:
             logger.warning(f"save_plan_failed: {e}")
 
