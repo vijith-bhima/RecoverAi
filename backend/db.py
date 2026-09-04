@@ -41,9 +41,22 @@ def _postgres_sql(sql: str) -> str:
     replace = re.search(r"INSERT\s+OR\s+REPLACE\s+INTO\s+([\w.]+)\s*\(([^)]+)\)", sql, flags=re.IGNORECASE | re.DOTALL)
     if replace:
         table, columns = replace.groups()
+        conflict_keys = {
+            "audit_logs": "event_id",
+            "checkouts": "checkout_id",
+            "customers": "customer_id",
+            "ground_truth": "payment_id",
+            "merchant_settings": "merchant_id, key",
+            "payments": "payment_id",
+            "recovery_attempts": "attempt_id",
+            "recovery_plans": "plan_id",
+            "scheduled_recovery_jobs": "job_id",
+        }.get(table)
+        if not conflict_keys:
+            raise ValueError(f"No PostgreSQL conflict key configured for {table}")
         assignments = ", ".join(f"{column.strip()} = EXCLUDED.{column.strip()}" for column in columns.split(","))
         sql = sql[:replace.start()] + f"INSERT INTO {table} ({columns})" + sql[replace.end():]
-        sql = sql.rstrip().rstrip(";") + f" ON CONFLICT DO UPDATE SET {assignments}"
+        sql = sql.rstrip().rstrip(";") + f" ON CONFLICT ({conflict_keys}) DO UPDATE SET {assignments}"
     elif is_ignore:
         sql = re.sub(r"INSERT\s+OR\s+IGNORE", "INSERT", sql, flags=re.IGNORECASE)
         sql = sql.rstrip().rstrip(";") + " ON CONFLICT DO NOTHING"
