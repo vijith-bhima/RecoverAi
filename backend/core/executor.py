@@ -20,7 +20,7 @@ from typing import Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from db import fetch_customer, fetch_ground_truth, fetch_setting, get_connection
+from db import fetch_customer, fetch_ground_truth, fetch_setting, get_connection, reserve_recovery_link, update_recovery_link
 from logging_config import get_logger
 from models.schemas import (
     AttemptStatus,
@@ -28,6 +28,8 @@ from models.schemas import (
     GuardrailOutcome,
     GuardrailResult,
     Payment,
+    PaymentStatus,
+    FailureReason,
     RecoveryAction,
     RecoveryAttempt,
 )
@@ -78,94 +80,111 @@ def execute_action(
 
     sim_message = _ACTION_MESSAGES.get(action, "Action executed.")
 
+    # A captured/paid payment and a Razorpay-owned native retry/checkout are
+    # never eligible for RecoverAI outreach, retries, links, or commitments.
+    native_owned = payment.failure_reason in (FailureReason.INTERNATIONAL_CARD_UNSUPPORTED, FailureReason.SUBSCRIPTION_RETRY_ACTIVE)
+    if payment.status in (PaymentStatus.SUCCESS, PaymentStatus.RECOVERED) or native_owned:
+        action = RecoveryAction.STOP
+        sim_message = "Razorpay native recovery/alternate checkout is being monitored." if native_owned else "Captured payment reconciled; no recovery action is permitted."
+
+
     # ── Real Razorpay API / Simulated Payment Link ────────────────────────────
     if action in (RecoveryAction.SEND_PAYMENT_LINK, RecoveryAction.ALTERNATE_PAYMENT_METHOD):
-        # Credentials and customer contact data are tenant-owned. Never read
-        # them from process-wide environment variables populated by another job.
-        razorpay_id = fetch_setting("razorpay_key_id", merchant_id=merchant_id) or os.getenv("RAZORPAY_KEY_ID")
-        razorpay_secret = fetch_setting("razorpay_key_secret", merchant_id=merchant_id) or os.getenv("RAZORPAY_KEY_SECRET")
-        customer = fetch_customer(payment.customer_id, merchant_id=merchant_id)
-        customer_email = (customer["email"] if customer and customer["email"] else "").strip() or f"{payment.customer_id}@example.com"
-        raw_phone = (customer["phone"] if customer and customer["phone"] else "").strip()
-        if raw_phone:
-            digits = "".join(ch for ch in raw_phone if ch.isdigit())
-            if len(digits) == 10:
-                customer_phone = f"+91{digits}"
-            elif not raw_phone.startswith("+"):
-                customer_phone = f"+{raw_phone}"
-            else:
-                customer_phone = raw_phone
+        reserved, existing_link = reserve_recovery_link(payment.payment_id, merchant_id)
+        if not reserved:
+            # This outcome is deliberately visible to callers/UI but does not
+            # contact the customer or call Razorpay again.
+            action = RecoveryAction.STOP
+            sim_message = "Existing recovery link monitored; no additional customer delivery occurred."
         else:
-            customer_phone = "+919876543210"
-
-        if os.getenv("EVALUATION_MODE") == "1":
-            razorpay_id = None
-            razorpay_secret = None
-
-        if razorpay_id and razorpay_secret and razorpay_id.startswith("rzp_"):
-            try:
-                import requests
-                from requests.auth import HTTPBasicAuth
-
-                desc = f"RecoverAI: Payment for Order #{payment.payment_id[-8:]}"
-                if action == RecoveryAction.ALTERNATE_PAYMENT_METHOD:
-                    desc = f"RecoverAI: Alternate payment link for Order #{payment.payment_id[-8:]}"
-
-                payload = {
-                    "amount": int(round(payment.amount * 100)),
-                    "currency": "INR",
-                    "accept_partial": False,
-                    "reference_id": payment.payment_id,
-                    "description": desc,
-                    "customer": {
-                        "name": f"Customer {payment.customer_id}",
-                        "contact": customer_phone,
-                        "email": customer_email,
-                    },
-                    "notify": {
-                        "sms": target_channel in (ChannelPreference.SMS, ChannelPreference.WHATSAPP),
-                        "email": target_channel == ChannelPreference.EMAIL,
-                    },
-                    "reminder_enable": True,
-                    "notes": {
-                        "recovered_by": "RecoverAI",
-                        "payment_id": payment.payment_id,
-                        "merchant_id": merchant_id,
-                        "failure_reason": payment.failure_reason.value,
-                        "priority": "HIGH" if payment.amount >= 5000 else "MEDIUM",
-                    },
-                }
-
-                resp = requests.post(
-                    "https://api.razorpay.com/v1/payment_links",
-                    json=payload,
-                    auth=HTTPBasicAuth(razorpay_id.strip(), razorpay_secret.strip()),
-                    timeout=8,
-                )
-
-                if resp.status_code in (200, 201):
-                    link_data = resp.json()
-                    short_url = link_data.get("short_url", "")
-                    link_id   = link_data.get("id", "")
-                    sim_message = f"Live Razorpay payment link dispatched via {target_channel.value}: {short_url}"
-                    logger.info(
-                        "razorpay.link_created",
-                        extra={
-                            "payment_id": payment.payment_id,
-                            "amount": payment.amount,
-                            "short_url": short_url,
-                            "link_id": link_id,
-                            "merchant_id": merchant_id,
-                        },
-                    )
+            # Credentials and customer contact data are tenant-owned. Never read
+            # them from process-wide environment variables populated by another job.
+            razorpay_id = fetch_setting("razorpay_key_id", merchant_id=merchant_id) or os.getenv("RAZORPAY_KEY_ID")
+            razorpay_secret = fetch_setting("razorpay_key_secret", merchant_id=merchant_id) or os.getenv("RAZORPAY_KEY_SECRET")
+            customer = fetch_customer(payment.customer_id, merchant_id=merchant_id)
+            customer_email = (customer["email"] if customer and customer["email"] else "").strip() or f"{payment.customer_id}@example.com"
+            raw_phone = (customer["phone"] if customer and customer["phone"] else "").strip()
+            if raw_phone:
+                digits = "".join(ch for ch in raw_phone if ch.isdigit())
+                if len(digits) == 10:
+                    customer_phone = f"+91{digits}"
+                elif not raw_phone.startswith("+"):
+                    customer_phone = f"+{raw_phone}"
                 else:
-                    logger.warning(
-                        f"razorpay.link_failed status={resp.status_code} body={resp.text[:300]}"
+                    customer_phone = raw_phone
+            else:
+                customer_phone = "+919876543210"
+
+            if os.getenv("EVALUATION_MODE") == "1":
+                razorpay_id = None
+                razorpay_secret = None
+
+            if razorpay_id and razorpay_secret and razorpay_id.startswith("rzp_"):
+                try:
+                    import requests
+                    from requests.auth import HTTPBasicAuth
+
+                    desc = f"RecoverAI: Payment for Order #{payment.payment_id[-8:]}"
+                    if action == RecoveryAction.ALTERNATE_PAYMENT_METHOD:
+                        desc = f"RecoverAI: Alternate payment link for Order #{payment.payment_id[-8:]}"
+
+                    payload = {
+                        "amount": int(round(payment.amount * 100)),
+                        "currency": "INR",
+                        "accept_partial": False,
+                        "reference_id": payment.payment_id,
+                        "description": desc,
+                        "customer": {
+                            "name": f"Customer {payment.customer_id}",
+                            "contact": customer_phone,
+                            "email": customer_email,
+                        },
+                        "notify": {
+                            "sms": target_channel in (ChannelPreference.SMS, ChannelPreference.WHATSAPP),
+                            "email": target_channel == ChannelPreference.EMAIL,
+                        },
+                        "reminder_enable": True,
+                        "notes": {
+                            "recovered_by": "RecoverAI",
+                            "payment_id": payment.payment_id,
+                            "merchant_id": merchant_id,
+                            "failure_reason": payment.failure_reason.value,
+                            "priority": "HIGH" if payment.amount >= 5000 else "MEDIUM",
+                        },
+                    }
+
+                    resp = requests.post(
+                        "https://api.razorpay.com/v1/payment_links",
+                        json=payload,
+                        auth=HTTPBasicAuth(razorpay_id.strip(), razorpay_secret.strip()),
+                        timeout=8,
                     )
-            except Exception as exc:
-                logger.warning(f"razorpay.api_exception: {exc}")
-        else:
-            sim_message = f"Payment link simulated via {target_channel.value} (Razorpay credentials not set)"
+
+                    if resp.status_code in (200, 201):
+                        link_data = resp.json()
+                        short_url = link_data.get("short_url", "")
+                        link_id   = link_data.get("id", "")
+                        update_recovery_link(payment.payment_id, merchant_id, "LIVE", link_id, short_url)
+                        sim_message = f"LIVE_LINK_DISPATCHED: {short_url}"
+                        logger.info(
+                            "razorpay.link_created",
+                            extra={
+                                "payment_id": payment.payment_id,
+                                "amount": payment.amount,
+                                "short_url": short_url,
+                                "link_id": link_id,
+                                "merchant_id": merchant_id,
+                            },
+                        )
+                    else:
+                        logger.warning(
+                            f"razorpay.link_failed status={resp.status_code} body={resp.text[:300]}"
+                        )
+                except Exception as exc:
+                    logger.warning(f"razorpay.api_exception: {exc}")
+            else:
+                update_recovery_link(payment.payment_id, merchant_id, "SIMULATED")
+                sim_message = f"SIMULATED_LINK_ONLY: Payment link simulated via {target_channel.value} (Razorpay credentials not set)"
 
     # ── Merchant Notification on Escalation ─────────────────────────────────
     if action == RecoveryAction.ESCALATE_TO_HUMAN:
@@ -210,7 +229,7 @@ def execute_action(
         # or active gateway status verification confirms payment.
         if action in (RecoveryAction.SEND_PAYMENT_LINK, RecoveryAction.ALTERNATE_PAYMENT_METHOD):
             outcome = AttemptStatus.PENDING
-            outcome_reason = f"Recovery link dispatched to customer via {target_channel.value}. Awaiting payment confirmation."
+            outcome_reason = sim_message
         elif action == RecoveryAction.RETRY:
             outcome = AttemptStatus.PENDING
             outcome_reason = "Gateway retry dispatched. Awaiting transaction outcome from processor."

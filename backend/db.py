@@ -246,6 +246,21 @@ CREATE TABLE IF NOT EXISTS recovery_attempts (
 );
 """
 
+# Durable tenant-scoped ownership record for the one customer recovery link.
+CREATE_RECOVERY_LINKS = """
+CREATE TABLE IF NOT EXISTS recovery_links (
+    recovery_link_id TEXT PRIMARY KEY,
+    merchant_id TEXT NOT NULL,
+    payment_id TEXT NOT NULL,
+    status TEXT NOT NULL,
+    razorpay_link_id TEXT,
+    short_url TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE (merchant_id, payment_id),
+    FOREIGN KEY (merchant_id) REFERENCES merchants(merchant_id)
+);
+"""
 CREATE_AUDIT_LOGS = """
 CREATE TABLE IF NOT EXISTS audit_logs (
     event_id            TEXT PRIMARY KEY,
@@ -377,6 +392,7 @@ CREATE_INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_attempts_merchant    ON recovery_attempts(merchant_id);",
     "CREATE INDEX IF NOT EXISTS idx_attempts_payment     ON recovery_attempts(payment_id);",
     "CREATE INDEX IF NOT EXISTS idx_attempts_user        ON recovery_attempts(user_id);",
+    "CREATE INDEX IF NOT EXISTS idx_recovery_links_mer_pay ON recovery_links(merchant_id, payment_id);",
     "CREATE INDEX IF NOT EXISTS idx_audit_merchant       ON audit_logs(merchant_id);",
     "CREATE INDEX IF NOT EXISTS idx_audit_mer_pay        ON audit_logs(merchant_id, payment_id);",
     "CREATE INDEX IF NOT EXISTS idx_audit_payment        ON audit_logs(payment_id);",
@@ -407,6 +423,7 @@ def init_db() -> None:
         conn.execute(CREATE_CHECKOUTS)
         conn.execute(CREATE_RECOVERY_PLANS)
         conn.execute(CREATE_RECOVERY_ATTEMPTS)
+        conn.execute(CREATE_RECOVERY_LINKS)
         conn.execute(CREATE_AUDIT_LOGS)
         conn.execute(CREATE_GHOST_REVENUE_INCIDENTS)
         conn.execute(CREATE_GHOST_REVENUE_EVENTS)
@@ -1188,6 +1205,28 @@ def fetch_scheduled_job(payment_id: str, merchant_id: Optional[str] = None) -> s
             (payment_id,),
         ).fetchone()
 
+
+def reserve_recovery_link(payment_id: str, merchant_id: str) -> tuple[bool, dict]:
+    """Atomically reserve this tenant's single RecoverAI recovery link."""
+    import uuid
+    link_id = f"rlnk_{uuid.uuid4().hex}"
+    now = datetime.now(timezone.utc).isoformat()
+    with get_connection() as conn:
+        conn.execute("INSERT OR IGNORE INTO recovery_links (recovery_link_id, merchant_id, payment_id, status, created_at, updated_at) VALUES (?, ?, ?, 'CREATING', ?, ?)", (link_id, merchant_id, payment_id, now, now))
+        row = conn.execute("SELECT * FROM recovery_links WHERE merchant_id = ? AND payment_id = ?", (merchant_id, payment_id)).fetchone()
+    record = dict(row)
+    return record["recovery_link_id"] == link_id, record
+
+
+def update_recovery_link(payment_id: str, merchant_id: str, status: str, razorpay_link_id: str = "", short_url: str = "") -> None:
+    with get_connection() as conn:
+        conn.execute("UPDATE recovery_links SET status = ?, razorpay_link_id = COALESCE(NULLIF(?, ''), razorpay_link_id), short_url = COALESCE(NULLIF(?, ''), short_url), updated_at = ? WHERE merchant_id = ? AND payment_id = ?", (status, razorpay_link_id, short_url, datetime.now(timezone.utc).isoformat(), merchant_id, payment_id))
+
+
+def fetch_recovery_link(payment_id: str, merchant_id: str) -> dict | None:
+    with get_connection() as conn:
+        row = conn.execute("SELECT * FROM recovery_links WHERE merchant_id = ? AND payment_id = ?", (merchant_id, payment_id)).fetchone()
+    return dict(row) if row else None
 
 # Ensure DB schema and migrations are initialized on module load
 

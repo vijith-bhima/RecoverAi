@@ -341,7 +341,7 @@ def _process_new_failures() -> int:
                 if action in ("SEND_PAYMENT_LINK", "ALTERNATE_PAYMENT_METHOD"):
                     _log_event("link_sent", merchant_id=row_mid, user_id=row_uid,
                         payment_id=payment.payment_id, amount=payment.amount,
-                        label="⚡ Payment link automatically sent",
+                        label="⚡ Live payment link dispatched" if razorpay_url else "🧪 Simulated/test link only",
                         sublabel=f"Razorpay link dispatched to customer" if razorpay_url else "Payment link dispatched to customer",
                         razorpay_url=razorpay_url)
                     with _agent_lock:
@@ -622,7 +622,7 @@ def _process_due_scheduled_jobs() -> int:
         if action in ("SEND_PAYMENT_LINK", "ALTERNATE_PAYMENT_METHOD"):
             _log_event("link_sent", merchant_id=job_mid, user_id=job_user_id,
                 payment_id=payment_id, amount=payment.amount,
-                label="⚡ Recovery payment link dispatched",
+                label="⚡ Live payment link dispatched" if "LIVE_LINK_DISPATCHED" in (attempt.reason or "") else ("🧪 Simulated/test link only" if "SIMULATED_LINK_ONLY" in (attempt.reason or "") else "👀 Existing recovery link monitored"),
                 sublabel=f"Sent to customer via {decision.preferred_channel.value}",
                 razorpay_url=razorpay_url)
             with _agent_lock:
@@ -711,7 +711,7 @@ def _bootstrap_agent_state():
 
                 if action == "SEND_PAYMENT_LINK":
                     _log_event("link_sent", merchant_id=row["merchant_id"], user_id=row["user_id"], payment_id=row["payment_id"], amount=amt,
-                               label="⚡ Payment link automatically sent",
+                               label="⚡ Live payment link dispatched" if razorpay_url else "🧪 Simulated/test link only",
                                sublabel="Razorpay link dispatched to customer" if razorpay_url else (row["reason"][:80] if row["reason"] else ""),
                                razorpay_url=razorpay_url)
                 elif action == "RETRY":
@@ -1695,7 +1695,7 @@ def _run_recovery_for_payment(payment_id: str, customer_email: str = "", custome
         if action in ("SEND_PAYMENT_LINK", "ALTERNATE_PAYMENT_METHOD"):
             _log_event("link_sent", merchant_id=row_mid, user_id=row_uid,
                 payment_id=payment_id, amount=payment.amount,
-                label="⚡ Recovery payment link dispatched",
+                label="⚡ Live payment link dispatched" if "LIVE_LINK_DISPATCHED" in (attempt.reason or "") else ("🧪 Simulated/test link only" if "SIMULATED_LINK_ONLY" in (attempt.reason or "") else "👀 Existing recovery link monitored"),
                 sublabel=f"Sent to customer via {decision.preferred_channel.value}",
                 razorpay_url=razorpay_url)
             with _agent_lock:
@@ -2361,8 +2361,8 @@ def capture_promise_to_pay(body: PromiseToPayRequest, request: Request):
     row = fetch_payment(body.payment_id, merchant_id=merchant_id)
     if not row:
         raise HTTPException(status_code=404, detail="Payment not found")
-    if row["failure_reason"] not in (FailureReason.SUBSCRIPTION_HALTED.value, FailureReason.INVOICE_OVERDUE.value):
-        raise HTTPException(status_code=409, detail="Promise-to-Pay is available only after native subscription recovery is exhausted or for overdue invoices")
+    if row["status"] not in (PaymentStatus.FAILED.value, PaymentStatus.PENDING.value) or row["failure_reason"] not in (FailureReason.SUBSCRIPTION_HALTED.value, FailureReason.INVOICE_OVERDUE.value):
+        raise HTTPException(status_code=409, detail="Promise-to-Pay is limited to genuinely unpaid halted subscriptions and overdue invoices")
     promise = create_promise_to_pay(f"ptp_{uuid4().hex[:12]}", body.payment_id, float(row["amount"]), body.promised_for.isoformat(), body.channel.value, merchant_id, user_id, body.customer_note)
     _log_event("promise_to_pay_captured", merchant_id=merchant_id, user_id=user_id, payment_id=body.payment_id, amount=float(row["amount"]), label="🤝 Promise-to-Pay captured", sublabel=f"Customer committed to pay by {body.promised_for.date().isoformat()} via {body.channel.value}")
     return {"status": "PROMISED", "promise": promise, "message": "Commitment recorded. A single follow-up may be scheduled; no duplicate payment link was sent."}
@@ -3431,6 +3431,13 @@ def resolve_escalated_case(body: CaseResolutionRequest, request: Request):
         customer_id = pay["customer_id"]
 
     if body.action == "DISPATCH_LINK":
+        if pay["status"] in (PaymentStatus.SUCCESS.value, PaymentStatus.RECOVERED.value) or pay["failure_reason"] in (FailureReason.INTERNATIONAL_CARD_UNSUPPORTED.value, FailureReason.SUBSCRIPTION_RETRY_ACTIVE.value):
+            raise HTTPException(status_code=409, detail="Razorpay-native or captured payments cannot receive a RecoverAI link")
+        from db import reserve_recovery_link, update_recovery_link
+        reserved, existing_link = reserve_recovery_link(body.payment_id, merchant_id)
+        if not reserved:
+            _log_event("existing_link_monitored", merchant_id=merchant_id, user_id=user_id, payment_id=body.payment_id, amount=amount, label="👀 Existing recovery link monitored", sublabel="No additional customer delivery occurred")
+            return {"status": "existing_link_monitored", "action": "SEND_PAYMENT_LINK", "link_url": existing_link.get("short_url")}
         from db import fetch_setting
         key_id = fetch_setting("razorpay_key_id", merchant_id=merchant_id) or os.getenv("RAZORPAY_KEY_ID")
         key_secret = fetch_setting("razorpay_key_secret", merchant_id=merchant_id) or os.getenv("RAZORPAY_KEY_SECRET")
@@ -3452,11 +3459,13 @@ def resolve_escalated_case(body: CaseResolutionRequest, request: Request):
                 )
                 if resp.status_code in (200, 201):
                     link_url = resp.json().get("short_url")
+                    update_recovery_link(body.payment_id, merchant_id, "LIVE", resp.json().get("id", ""), link_url or "")
+                    update_recovery_link(body.payment_id, merchant_id, "LIVE", resp.json().get("id", ""), link_url or "")
             except Exception:
                 pass
 
         if not link_url:
-            link_url = f"https://rzp.io/i/manual_{body.payment_id[-6:]}"
+            update_recovery_link(body.payment_id, merchant_id, "SIMULATED")
 
         with get_connection() as conn:
             conn.execute("""
@@ -3475,8 +3484,8 @@ def resolve_escalated_case(body: CaseResolutionRequest, request: Request):
 
         _log_event("link_sent", merchant_id=merchant_id, user_id=user_id,
             payment_id=body.payment_id, amount=amount,
-            label="⚡ Human Approved: Payment Link Dispatched",
-            sublabel=f"Approved by merchant agent · {link_url}",
+            label="⚡ Live payment link dispatched" if link_url else "🧪 Simulated/test link only",
+            sublabel=f"Approved by merchant agent · {link_url}" if link_url else "No Razorpay live link was created or delivered",
             razorpay_url=link_url)
 
         return {"status": "resolved", "action": "SEND_PAYMENT_LINK", "link_url": link_url}
