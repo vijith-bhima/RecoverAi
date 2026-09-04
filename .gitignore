@@ -84,3 +84,5 @@ Thumbs.db
 
 # Local TypeScript metadata
 frontend/tsconfig.tsbuildinfo
+
+.git-backups/
