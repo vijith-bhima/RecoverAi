@@ -594,6 +594,13 @@ def fetch_merchant_by_webhook_secret(secret: str) -> sqlite3.Row | None:
         return conn.execute("SELECT * FROM merchants WHERE razorpay_webhook_secret = ?", (secret,)).fetchone()
 
 
+def fetch_all_merchants() -> list[sqlite3.Row]:
+    """List all registered merchants."""
+    with get_connection() as conn:
+        return conn.execute("SELECT * FROM merchants ORDER BY created_at ASC").fetchall()
+
+
+
 def fetch_merchant_by_api_key(api_key: str) -> sqlite3.Row | None:
     """Look up merchant by an active user API key."""
     with get_connection() as conn:

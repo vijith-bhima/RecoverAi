@@ -64,6 +64,11 @@ from db import (
     fetch_all_customers,
     fetch_all_audit_logs,
     fetch_all_checkouts,
+    fetch_recovery_plan,
+    save_recovery_plan,
+    fetch_merchant_by_id,
+    fetch_all_merchants,
+    update_merchant,
 )
 from models.schemas import (
     AgentDecision,
@@ -138,14 +143,23 @@ app = FastAPI(
     lifespan=app_lifespan,
 )
 
+cors_origins_env = os.getenv(
+    "CORS_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000"
+)
+if cors_origins_env.strip() == "*":
+    cors_origins = ["*"]
+else:
+    cors_origins = [origin.strip() for origin in cors_origins_env.split(",") if origin.strip()]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[origin.strip() for origin in os.getenv(
-        "CORS_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000"
-    ).split(",") if origin.strip()],
+    allow_origins=cors_origins,
+    allow_origin_regex=r"https://.*\.vercel\.app" if "*" not in cors_origins else None,
+    allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-    allow_headers=["Authorization", "Content-Type", "X-API-Key", "X-Request-ID"],
+    allow_headers=["*"],
 )
+
 
 
 @app.middleware("http")
@@ -1710,20 +1724,50 @@ async def razorpay_webhook(request: Request, background_tasks: BackgroundTasks):
     raw_body = await request.body()
     sig_header = request.headers.get("x-razorpay-signature", "")
 
-    # A merchant id is only a routing hint; the HMAC below is what authenticates
-    # the event. This avoids putting a long-lived API key in the webhook URL.
-    from db import fetch_merchant_by_id
-    merchant_id_hint = request.query_params.get("merchant_id")
-    if not merchant_id_hint:
-        raise HTTPException(status_code=403, detail="Webhook merchant context is required")
-    matched_merchant = fetch_merchant_by_id(merchant_id_hint)
-    if not matched_merchant:
-        raise HTTPException(status_code=403, detail="Unknown webhook merchant")
+    # A merchant id is a routing hint; the HMAC signature authenticates the payload.
+    from db import fetch_merchant_by_id, fetch_all_merchants, fetch_setting
+    merchant_id_hint = request.query_params.get("merchant_id") or request.headers.get("x-merchant-id")
+    
+    matched_merchant = None
+    resolved_secret = None
 
-    webhook_secret = fetch_setting("razorpay_webhook_secret", merchant_id=merchant_id_hint) or matched_merchant["razorpay_webhook_secret"] or ""
-    if not _verify_razorpay_signature(raw_body, sig_header, webhook_secret):
-        logger.warning("webhook.invalid_signature", extra={"merchant_id": merchant_id_hint})
-        raise HTTPException(status_code=403, detail="Invalid webhook signature")
+    if merchant_id_hint:
+        matched_merchant = fetch_merchant_by_id(merchant_id_hint)
+        if matched_merchant:
+            secret_candidate = (
+                fetch_setting("razorpay_webhook_secret", merchant_id=merchant_id_hint)
+                or matched_merchant["razorpay_webhook_secret"]
+                or (os.getenv("RAZORPAY_WEBHOOK_SECRET") if merchant_id_hint in ("mer_default", "") else "")
+                or ""
+            )
+            if _verify_razorpay_signature(raw_body, sig_header, secret_candidate):
+                resolved_secret = secret_candidate
+
+    # If no hint or hint signature failed, perform automatic HMAC resolution across tenants
+    if not resolved_secret:
+        # 1. Try default tenant with environment secret or DB setting
+        default_secret = (
+            fetch_setting("razorpay_webhook_secret", merchant_id="mer_default")
+            or os.getenv("RAZORPAY_WEBHOOK_SECRET")
+            or ""
+        )
+        if default_secret and _verify_razorpay_signature(raw_body, sig_header, default_secret):
+            matched_merchant = fetch_merchant_by_id("mer_default")
+            resolved_secret = default_secret
+        else:
+            # 2. Iterate registered merchants
+            for m in fetch_all_merchants():
+                m_id = m["merchant_id"]
+                s = fetch_setting("razorpay_webhook_secret", merchant_id=m_id) or m["razorpay_webhook_secret"] or ""
+                if s and _verify_razorpay_signature(raw_body, sig_header, s):
+                    matched_merchant = m
+                    resolved_secret = s
+                    break
+
+    if not matched_merchant or not resolved_secret:
+        logger.warning("webhook.invalid_signature_or_merchant", extra={"merchant_id": merchant_id_hint})
+        raise HTTPException(status_code=403, detail="Invalid webhook signature or unconfigured webhook secret")
+
 
     try:
         import json
@@ -2217,8 +2261,20 @@ def get_payment_recovery_plan(payment_id: str, request: Request):
     score = score_recovery(payment, customer)
     decision = get_agent_decision(payment, score, customer)
     if decision.plan:
+        save_recovery_plan(
+            plan_id=decision.plan.plan_id,
+            payment_id=payment.payment_id,
+            strategy=decision.plan.strategy.value if hasattr(decision.plan.strategy, "value") else str(decision.plan.strategy),
+            steps=[s.model_dump() if hasattr(s, "model_dump") else s for s in decision.plan.steps],
+            priority=decision.plan.priority.value if hasattr(decision.plan.priority, "value") else str(decision.plan.priority),
+            expected_recovery_value=decision.plan.expected_recovery_value,
+            created_at=datetime.now(timezone.utc).isoformat(),
+            merchant_id=merchant_id,
+            user_id=user["user_id"],
+        )
         return decision.plan.model_dump()
     raise HTTPException(status_code=500, detail="Could not construct recovery plan")
+
 
 
 
@@ -2933,6 +2989,7 @@ def _public_api_base_url() -> str:
     """Return the externally reachable API origin used in integration instructions."""
     return (
         os.getenv("PUBLIC_API_URL")
+        or os.getenv("RENDER_EXTERNAL_URL")
         or os.getenv("APP_BASE_URL")
         or "http://127.0.0.1:8000"
     ).rstrip("/")
@@ -2941,14 +2998,31 @@ def _public_api_base_url() -> str:
 @app.get("/api/settings", tags=["Merchant Settings"])
 def get_merchant_settings(request: Request):
     """Retrieve the current active merchant, guardrail, and channel configuration for the authenticated tenant."""
-    from db import fetch_all_settings
+    from db import fetch_all_settings, fetch_merchant_by_id
     user = get_current_user_context(request)
     user_id = user["user_id"]
     merchant_id = user["merchant_id"]
     stored = fetch_all_settings(merchant_id=merchant_id)
+    merchant = fetch_merchant_by_id(merchant_id)
 
-    # Only return keys that the merchant themselves saved — never expose developer .env keys
-    saved_key_id = stored.get("razorpay_key_id", "")
+    # Return merchant saved key ID, with graceful fallback to environment variables for default tenant
+    saved_key_id = (
+        stored.get("razorpay_key_id")
+        or (merchant["razorpay_key_id"] if merchant else None)
+        or (os.getenv("RAZORPAY_KEY_ID", "") if merchant_id in ("mer_default", "") else "")
+        or ""
+    )
+    key_secret_configured = bool(
+        stored.get("razorpay_key_secret")
+        or (merchant["razorpay_webhook_secret"] if merchant and merchant.get("razorpay_webhook_secret") else None)
+        or (os.getenv("RAZORPAY_KEY_SECRET") if merchant_id in ("mer_default", "") else None)
+    )
+    webhook_secret_configured = bool(
+        stored.get("razorpay_webhook_secret")
+        or (merchant["razorpay_webhook_secret"] if merchant else None)
+        or (os.getenv("RAZORPAY_WEBHOOK_SECRET") if merchant_id in ("mer_default", "") else None)
+    )
+
     return {
         "brand_name": stored.get("brand_name", user.get("company_name", "RecoverAI Merchant")),
         "support_email": stored.get("support_email", user.get("email", "support@merchant.com")),
@@ -2956,11 +3030,11 @@ def get_merchant_settings(request: Request):
         "user_email": user.get("email", ""),
         "user_full_name": user.get("full_name", ""),
         "api_key": user.get("api_key", ""),
-        # Return saved key ID only if the merchant saved it; blank otherwise
+        # Return saved key ID
         "razorpay_key_id": saved_key_id,
-        # Never return secrets — only a boolean flag so the UI shows ✓ configured
-        "razorpay_key_secret_configured": bool(stored.get("razorpay_key_secret")),
-        "razorpay_webhook_secret_configured": bool(stored.get("razorpay_webhook_secret")),
+        # Never return secrets in plaintext — return boolean flags so the UI shows ✓ configured
+        "razorpay_key_secret_configured": key_secret_configured,
+        "razorpay_webhook_secret_configured": webhook_secret_configured,
         # The endpoint is shared by the API service, but the merchant query
         # parameter is unique and binds incoming events to this tenant.
         "webhook_url": f"{_public_api_base_url()}/webhooks/razorpay?merchant_id={merchant_id}",
@@ -2977,7 +3051,7 @@ def get_merchant_settings(request: Request):
 @app.post("/api/settings", tags=["Merchant Settings"])
 def update_merchant_settings(body: MerchantSettingsRequest, request: Request):
     """Update and persist merchant settings and guardrail limits for the authenticated tenant."""
-    from db import save_setting
+    from db import save_setting, update_merchant
     user = get_current_user_context(request)
     user_id = user["user_id"]
     merchant_id = user["merchant_id"]
@@ -2987,10 +3061,12 @@ def update_merchant_settings(body: MerchantSettingsRequest, request: Request):
     if body.support_email: save_setting("support_email", body.support_email, merchant_id=merchant_id)
     if body.razorpay_key_id:
         save_setting("razorpay_key_id", body.razorpay_key_id, merchant_id=merchant_id)
+        update_merchant(merchant_id, razorpay_key_id=body.razorpay_key_id)
     if body.razorpay_key_secret:
         save_setting("razorpay_key_secret", body.razorpay_key_secret, merchant_id=merchant_id)
     if body.razorpay_webhook_secret:
         save_setting("razorpay_webhook_secret", body.razorpay_webhook_secret, merchant_id=merchant_id)
+        update_merchant(merchant_id, razorpay_webhook_secret=body.razorpay_webhook_secret)
     if body.max_autonomous_amount is not None:
         save_setting("max_autonomous_amount", str(body.max_autonomous_amount), merchant_id=merchant_id)
     if body.max_retry_attempts is not None:
@@ -3004,6 +3080,7 @@ def update_merchant_settings(body: MerchantSettingsRequest, request: Request):
 
     logger.info("merchant_settings.updated", extra={"user_id": user_id})
     return {"status": "success", "message": "Merchant settings saved successfully."}
+
 
 
 class TestRazorpayRequest(BaseModel):

@@ -32,6 +32,10 @@ export default function SettingsPage() {
   const [showWebhookSecret, setShowWebhookSecret] = useState(false);
   const [showApiKey, setShowApiKey] = useState(false);
 
+  // Secret configured status from backend vault
+  const [razorpayKeySecretConfigured, setRazorpayKeySecretConfigured] = useState(false);
+  const [razorpayWebhookSecretConfigured, setRazorpayWebhookSecretConfigured] = useState(false);
+
   // Test connection state
   const [testingConnection, setTestingConnection] = useState(false);
   const [testResult, setTestResult] = useState<{ status: 'success' | 'error'; message: string } | null>(null);
@@ -73,9 +77,14 @@ export default function SettingsPage() {
       const res = await apiFetch('/api/settings');
       if (res.ok) {
         const data = await res.json();
+        setRazorpayKeySecretConfigured(Boolean(data.razorpay_key_secret_configured));
+        setRazorpayWebhookSecretConfigured(Boolean(data.razorpay_webhook_secret_configured));
         setSettings(prev => ({
           ...prev,
           ...data,
+          // Keep secrets empty in client state so placeholders show configured status
+          razorpay_key_secret: '',
+          razorpay_webhook_secret: '',
           // Keep the integration URL tenant-specific even when an older API
           // response or a cached page omits it.
           webhook_url: data.webhook_url || `${API_ORIGIN}/webhooks/razorpay?merchant_id=${encodeURIComponent(user?.merchant_id || '')}`,
@@ -101,6 +110,7 @@ export default function SettingsPage() {
       if (res.ok) {
         setSaveSuccess(true);
         setTimeout(() => setSaveSuccess(false), 4000);
+        await fetchSettings();
       }
     } catch (err) {
       console.error('Save settings error:', err);
@@ -153,10 +163,21 @@ export default function SettingsPage() {
   };
 
   const handleTestRazorpay = async () => {
-    if (!settings.razorpay_key_id.trim() || !settings.razorpay_key_secret.trim()) {
+    const hasKeyId = Boolean(settings.razorpay_key_id.trim());
+    const hasSecret = Boolean(settings.razorpay_key_secret.trim() || razorpayKeySecretConfigured);
+
+    if (!hasKeyId) {
       setTestResult({
         status: 'error',
-        message: 'Please enter both your Razorpay Key ID and Key Secret in the fields below before testing.',
+        message: 'Please enter your Razorpay Key ID in the field below before testing.',
+      });
+      return;
+    }
+
+    if (!hasSecret) {
+      setTestResult({
+        status: 'error',
+        message: 'Please enter your Razorpay Key Secret in the field below before testing.',
       });
       return;
     }
@@ -164,13 +185,14 @@ export default function SettingsPage() {
     setTestingConnection(true);
     setTestResult(null);
     try {
+      const payload: any = { key_id: settings.razorpay_key_id };
+      if (settings.razorpay_key_secret.trim()) {
+        payload.key_secret = settings.razorpay_key_secret.trim();
+      }
       const res = await apiFetch('/api/settings/test-razorpay', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          key_id: settings.razorpay_key_id,
-          key_secret: settings.razorpay_key_secret,
-        }),
+        body: JSON.stringify(payload),
       });
       const data = await res.json();
       if (res.ok && data.status === 'connected') {
@@ -184,6 +206,7 @@ export default function SettingsPage() {
       setTestingConnection(false);
     }
   };
+
 
   const copyWebhookUrl = () => {
     navigator.clipboard.writeText(settings.webhook_url);
@@ -377,9 +400,20 @@ export default function SettingsPage() {
               {/* Key Secret */}
               <div className="space-y-2">
                 <div className="flex items-center justify-between">
-                  <label className="block text-xs font-bold text-gray-700 uppercase tracking-wider">
-                    Razorpay Key Secret
-                  </label>
+                  <div className="flex items-center gap-2">
+                    <label className="block text-xs font-bold text-gray-700 uppercase tracking-wider">
+                      Razorpay Key Secret
+                    </label>
+                    {razorpayKeySecretConfigured ? (
+                      <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[10px] font-bold bg-emerald-50 text-emerald-700 border border-emerald-200">
+                        <CheckCircle2 className="h-3 w-3 text-emerald-600" /> Saved in Vault
+                      </span>
+                    ) : (
+                      <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[10px] font-bold bg-amber-50 text-amber-700 border border-amber-200">
+                        Not Saved
+                      </span>
+                    )}
+                  </div>
                   <button
                     type="button"
                     onClick={() => setShowKeySecret(!showKeySecret)}
@@ -395,7 +429,7 @@ export default function SettingsPage() {
                     autoComplete="new-password"
                     value={settings.razorpay_key_secret}
                     onChange={(e) => setSettings({ ...settings, razorpay_key_secret: e.target.value })}
-                    placeholder="Enter Razorpay Key Secret"
+                    placeholder={razorpayKeySecretConfigured ? '•••••••••••••••• (Secret saved — enter new secret to update)' : 'Enter Razorpay Key Secret'}
                     className="w-full bg-gray-50/70 border border-gray-200 rounded-2xl px-4 py-3 text-sm font-mono text-gray-900 focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-600 transition-all pr-12"
                   />
                   <button
@@ -406,8 +440,13 @@ export default function SettingsPage() {
                     {showKeySecret ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
                   </button>
                 </div>
-                <p className="text-[11px] text-gray-400">Kept encrypted on server. Never exposed to browser or client bundles.</p>
+                <p className="text-[11px] text-gray-400">
+                  {razorpayKeySecretConfigured
+                    ? 'Encrypted securely in server vault. Leave blank when saving other settings to retain.'
+                    : 'Kept encrypted on server. Never exposed to browser or client bundles.'}
+                </p>
               </div>
+
             </div>
 
             {/* Test Connection Box */}
@@ -497,9 +536,20 @@ export default function SettingsPage() {
                 {/* Razorpay Webhook Secret */}
                 <div className="space-y-2">
                   <div className="flex items-center justify-between">
-                    <label className="block text-xs font-bold text-gray-700 uppercase tracking-wider">
-                      Webhook Secret (HMAC Verification)
-                    </label>
+                    <div className="flex items-center gap-2">
+                      <label className="block text-xs font-bold text-gray-700 uppercase tracking-wider">
+                        Webhook Secret (HMAC Verification)
+                      </label>
+                      {razorpayWebhookSecretConfigured ? (
+                        <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[10px] font-bold bg-emerald-50 text-emerald-700 border border-emerald-200">
+                          <CheckCircle2 className="h-3 w-3 text-emerald-600" /> Saved &amp; Active
+                        </span>
+                      ) : (
+                        <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[10px] font-bold bg-amber-50 text-amber-700 border border-amber-200">
+                          Not Saved
+                        </span>
+                      )}
+                    </div>
                     <button
                       type="button"
                       onClick={() => setShowWebhookSecret(!showWebhookSecret)}
@@ -515,7 +565,7 @@ export default function SettingsPage() {
                       autoComplete="new-password"
                       value={settings.razorpay_webhook_secret}
                       onChange={(e) => setSettings({ ...settings, razorpay_webhook_secret: e.target.value })}
-                      placeholder="Enter Webhook Secret configured in Razorpay"
+                      placeholder={razorpayWebhookSecretConfigured ? '•••••••••••••••• (Secret saved — enter new secret to update)' : 'Enter Webhook Secret configured in Razorpay'}
                       className="w-full bg-gray-50/70 border border-gray-200 rounded-2xl px-4 py-3 text-sm font-mono text-gray-900 focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-600 transition-all pr-12"
                     />
                     <button
@@ -527,6 +577,7 @@ export default function SettingsPage() {
                     </button>
                   </div>
                 </div>
+
 
                 {/* Events Checklist */}
                 <div className="space-y-2 pt-2">
