@@ -28,6 +28,7 @@ import {
   Sparkles,
   Moon,
   Sun,
+  BookOpen,
 } from 'lucide-react';
 import { useAuth } from '../lib/auth-context';
 import AuthModal from './AuthModal';
@@ -154,6 +155,7 @@ export default function DashboardLayout({ children }: { children: React.ReactNod
     if (pathname === '/recovery-cases') return 'Recovery Cases';
     if (pathname === '/audit-trail') return 'Audit Trail';
     if (pathname === '/ghost-revenue') return 'Ghost Revenue Hunter';
+    if (pathname === '/guide') return 'Getting Started';
     return pathname.substring(1);
   };
 
@@ -208,8 +210,9 @@ export default function DashboardLayout({ children }: { children: React.ReactNod
             <NavItem icon={Users} label="Customers" href="/customers" />
             <NavItem icon={CreditCard} label="Payments" href="/payments" />
             <NavItem icon={BarChart2} label="Analytics" href="/analytics" />
-            <div className="pt-2 pb-1">
             <NavItem icon={Brain} label="Recovery Passport" href="/recovery-passport" />
+            <NavItem icon={BookOpen} label="User Guide" href="/guide" />
+            <div className="pt-2 pb-1">
               <p className="text-[10px] font-bold text-gray-400 uppercase tracking-widest px-3 mb-1">Automation</p>
             </div>
             <NavItem icon={Zap} label="Recovery assistant" href="/recover" accent={true} />
