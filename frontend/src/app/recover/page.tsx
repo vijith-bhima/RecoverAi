@@ -84,7 +84,7 @@ export default function AgentConsolePage() {
         setStatus(data);
         setIsPaused(!data.active);
       }
-    } catch {}
+    } catch { }
   };
 
   const fetchActivity = async () => {
@@ -95,7 +95,7 @@ export default function AgentConsolePage() {
       if (data.events && Array.isArray(data.events)) {
         setEvents(data.events);
       }
-    } catch {}
+    } catch { }
   };
 
   const toggleAgent = async () => {
@@ -180,7 +180,7 @@ export default function AgentConsolePage() {
 
   return (
     <div className="max-w-[1440px] mx-auto space-y-6 pt-2 pb-16">
-      
+
       {/* Page Header */}
       <div>
         <h1 className="text-xl sm:text-2xl md:text-3xl font-serif font-bold text-gray-900 tracking-tight">Recovery assistant</h1>
@@ -189,7 +189,7 @@ export default function AgentConsolePage() {
 
       {/* Top Hero Section: How It Works + Agent Status */}
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-        
+
         {/* Left: How RecoverAI Agent Works (2 Cols) */}
         <div className="lg:col-span-2 relative overflow-hidden bg-gradient-to-br from-[#F8F6FF] via-[#F4EFFF] to-[#FDFBFF] border border-[#E9E2FF] rounded-[28px] p-6 md:p-8 shadow-sm flex flex-col justify-between">
           <div className="space-y-6">
@@ -287,9 +287,8 @@ export default function AgentConsolePage() {
                 <div className="h-2 w-2 rounded-full bg-emerald-500 animate-pulse" />
                 <h3 className="text-sm font-bold text-gray-900">Agent Status</h3>
               </div>
-              <span className={`inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-bold ${
-                !isPaused ? 'bg-emerald-50 text-emerald-700' : 'bg-gray-100 text-gray-600'
-              }`}>
+              <span className={`inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-bold ${!isPaused ? 'bg-emerald-50 text-emerald-700' : 'bg-gray-100 text-gray-600'
+                }`}>
                 {!isPaused ? <Check className="h-3 w-3 text-emerald-600" /> : <Pause className="h-3 w-3" />}
                 {!isPaused ? 'Running Smoothly' : 'Agent Paused'}
               </span>
@@ -327,7 +326,7 @@ export default function AgentConsolePage() {
 
       {/* Middle Grid: Live Agent Activity Table + Right Widgets */}
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-        
+
         {/* Left: Live Agent Activity (2 Cols) */}
         <div className="lg:col-span-2 bg-white rounded-[28px] border border-gray-100 p-6 shadow-sm space-y-4">
           <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-3">
@@ -392,15 +391,15 @@ export default function AgentConsolePage() {
           )}
 
           {/* Activity Table */}
-          <div className="overflow-x-auto">
-            <table className="w-full text-left border-collapse">
+          <div className="overflow-x-auto custom-scrollbar -mx-2 px-2">
+            <table className="w-full text-left border-collapse min-w-[700px]">
               <thead>
                 <tr className="border-b border-gray-100 text-[10px] font-bold text-gray-400 uppercase tracking-wider">
-                  <th className="py-2.5 px-3">TIME</th>
-                  <th className="py-2.5 px-3">EVENT</th>
-                  <th className="py-2.5 px-3">PAYMENT / CUSTOMER</th>
-                  <th className="py-2.5 px-3">AGENT STEP</th>
-                  <th className="py-2.5 px-3 text-right">STATUS</th>
+                  <th className="py-2.5 px-3 w-[100px]">TIME</th>
+                  <th className="py-2.5 px-3 w-[220px]">EVENT & STAGE</th>
+                  <th className="py-2.5 px-3 w-[160px]">PAYMENT / AMOUNT</th>
+                  <th className="py-2.5 px-3">AGENT DIAGNOSIS & STEP</th>
+                  <th className="py-2.5 px-3 text-right w-[120px]">STATUS</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-gray-50 text-xs">
@@ -417,96 +416,137 @@ export default function AgentConsolePage() {
                     const isAction = ev.type === 'link_sent' || ev.type === 'retried' || ev.type === 'escalated';
                     const isRecovered = ev.type === 'recovered';
 
+                    // Determine crisp status label and colors
+                    let statusLabel = 'PROCESSED';
+                    let statusColor = 'bg-purple-50 text-purple-700 border-purple-200/60';
+                    let dotColor = 'bg-purple-500';
+
+                    if (isRecovered) {
+                      statusLabel = 'RECOVERED';
+                      statusColor = 'bg-emerald-50 text-emerald-700 border-emerald-200/60 font-bold';
+                      dotColor = 'bg-emerald-500';
+                    } else if (isWait) {
+                      statusLabel = 'WAITING';
+                      statusColor = 'bg-amber-50 text-amber-800 border-amber-200/60 font-bold';
+                      dotColor = 'bg-amber-500 animate-ping';
+                    } else if (isNativeMonitoring) {
+                      statusLabel = 'MONITORING';
+                      statusColor = 'bg-cyan-50 text-cyan-800 border-cyan-200/60 font-bold';
+                      dotColor = 'bg-cyan-500';
+                    } else if (ev.type === 'guardrail_blocked' || (isAction && ev.label?.toLowerCase().includes('escalat'))) {
+                      statusLabel = 'ESCALATED';
+                      statusColor = 'bg-orange-50 text-orange-800 border-orange-200/60 font-bold';
+                      dotColor = 'bg-orange-500';
+                    } else if (ev.type === 'guardrail_approved') {
+                      statusLabel = 'APPROVED';
+                      statusColor = 'bg-emerald-50 text-emerald-700 border-emerald-200/60';
+                      dotColor = 'bg-emerald-500';
+                    } else if (ev.type === 'link_sent') {
+                      statusLabel = 'DISPATCHED';
+                      statusColor = 'bg-indigo-50 text-indigo-700 border-indigo-200/60 font-bold';
+                      dotColor = 'bg-indigo-500';
+                    } else if (isFailed) {
+                      statusLabel = 'INGESTED';
+                      statusColor = 'bg-rose-50 text-rose-700 border-rose-200/60';
+                      dotColor = 'bg-rose-500';
+                    } else if (isScored || isPlan || isPlaybook) {
+                      statusLabel = 'ANALYZED';
+                      statusColor = 'bg-indigo-50 text-indigo-700 border-indigo-200/60';
+                      dotColor = 'bg-indigo-500';
+                    }
+
+                    // Format payment ID nicely if long
+                    const shortPaymentId = ev.payment_id?.length > 18
+                      ? `${ev.payment_id.slice(0, 12)}...${ev.payment_id.slice(-4)}`
+                      : ev.payment_id;
+
                     return (
-                      <tr key={idx} className="hover:bg-gray-50/50 transition-colors">
-                        <td className="py-3.5 px-3 whitespace-nowrap">
+                      <tr key={idx} className="hover:bg-indigo-50/20 transition-colors">
+                        <td className="py-3 px-3 whitespace-nowrap align-top">
                           <div className="font-semibold text-gray-800 text-[11px]">{fmtTime(ev.ts)}</div>
                           <div className="text-[10px] text-gray-400">{getRelativeTime(ev.ts)}</div>
                         </td>
 
-                        <td className="py-3.5 px-3 whitespace-nowrap">
-                          <div className="flex items-center gap-2">
-                            <div className={`h-7 w-7 rounded-lg flex items-center justify-center text-xs ${
-                              isFailed ? 'bg-pink-50 text-pink-600' :
-                              isScored ? 'bg-purple-50 text-purple-600' :
-                              isPlaybook ? 'bg-indigo-50 text-indigo-600' :
-                              isPlan ? 'bg-sky-50 text-sky-600' :
-                              isWait ? 'bg-amber-50 text-amber-600 animate-pulse' :
-                              isRechecked ? 'bg-blue-50 text-blue-600' :
-                              isNativeMonitoring ? 'bg-cyan-50 text-cyan-700' :
-                              isGuard ? 'bg-emerald-50 text-emerald-600' :
-                              isRecovered ? 'bg-emerald-100 text-emerald-700 font-bold' : 'bg-indigo-50 text-indigo-600'
-                            }`}>
-                              {isFailed ? '🔴' :
-                               isScored ? '🧠' :
-                               isPlaybook ? '📋' :
-                               isPlan ? '🗺️' :
-                               isWait ? '⏳' :
-                               isRechecked ? '🔍' :
-                               isNativeMonitoring ? '👀' :
-                               isGuard ? '🛡️' :
-                               isRecovered ? '✅' : '⚡'}
-                            </div>
-                            <div>
-                              <div className="font-bold text-gray-900 text-xs">{ev.label}</div>
-                              <span className={`inline-block text-[9px] font-bold uppercase tracking-wider px-1.5 py-0.5 rounded ${
-                                isFailed ? 'bg-pink-100 text-pink-700' :
-                                isScored ? 'bg-purple-100 text-purple-700' :
-                                isPlaybook ? 'bg-indigo-100 text-indigo-700' :
-                                isPlan ? 'bg-sky-100 text-sky-700' :
-                                isWait ? 'bg-amber-100 text-amber-800 font-extrabold' :
-                                isRechecked ? 'bg-blue-100 text-blue-700' :
-                                isNativeMonitoring ? 'bg-cyan-100 text-cyan-800' :
-                                isGuard ? 'bg-emerald-100 text-emerald-700' :
-                                isRecovered ? 'bg-emerald-200 text-emerald-900' : 'bg-indigo-100 text-indigo-700'
+                        <td className="py-3 px-3 align-top">
+                          <div className="flex items-start gap-2.5">
+                            <div className={`h-7 w-7 rounded-lg flex items-center justify-center text-xs shrink-0 mt-0.5 ${isFailed ? 'bg-pink-50 text-pink-600' :
+                                isScored ? 'bg-purple-50 text-purple-600' :
+                                  isPlaybook ? 'bg-indigo-50 text-indigo-600' :
+                                    isPlan ? 'bg-sky-50 text-sky-600' :
+                                      isWait ? 'bg-amber-50 text-amber-600 animate-pulse' :
+                                        isRechecked ? 'bg-blue-50 text-blue-600' :
+                                          isNativeMonitoring ? 'bg-cyan-50 text-cyan-700' :
+                                            isGuard ? 'bg-emerald-50 text-emerald-600' :
+                                              isRecovered ? 'bg-emerald-100 text-emerald-700 font-bold' : 'bg-indigo-50 text-indigo-600'
                               }`}>
+                              {isFailed ? '🔴' :
+                                isScored ? '🧠' :
+                                  isPlaybook ? '📋' :
+                                    isPlan ? '🗺️' :
+                                      isWait ? '⏳' :
+                                        isRechecked ? '🔍' :
+                                          isNativeMonitoring ? '👀' :
+                                            isGuard ? '🛡️' :
+                                              isRecovered ? '✅' : '⚡'}
+                            </div>
+                            <div className="min-w-0">
+                              <div className="font-bold text-gray-900 text-xs truncate max-w-[170px]" title={ev.label}>
+                                {ev.label}
+                              </div>
+                              <span className={`inline-block text-[9px] font-bold uppercase tracking-wider px-1.5 py-0.5 rounded mt-0.5 ${isFailed ? 'bg-pink-100 text-pink-700' :
+                                  isScored ? 'bg-purple-100 text-purple-700' :
+                                    isPlaybook ? 'bg-indigo-100 text-indigo-700' :
+                                      isPlan ? 'bg-sky-100 text-sky-700' :
+                                        isWait ? 'bg-amber-100 text-amber-800 font-extrabold' :
+                                          isRechecked ? 'bg-blue-100 text-blue-700' :
+                                            isNativeMonitoring ? 'bg-cyan-100 text-cyan-800' :
+                                              isGuard ? 'bg-emerald-100 text-emerald-700' :
+                                                isRecovered ? 'bg-emerald-200 text-emerald-900' : 'bg-indigo-100 text-indigo-700'
+                                }`}>
                                 {isFailed ? 'PAYMENT FAILED' :
-                                 isScored ? 'ML DIAGNOSED' :
-                                 isPlaybook ? 'PLAYBOOK SELECTED' :
-                                 isPlan ? 'PLAN CREATED' :
-                                 isWait ? 'WAITING / SCHEDULED' :
-                                 isRechecked ? 'STATUS RECHECKED' :
-                                 isNativeMonitoring ? 'RAZORPAY MONITORING' :
-                                 isGuard ? 'GUARDRAIL CHECK' :
-                                 isRecovered ? 'RECOVERED' : 'ACTION DISPATCHED'}
+                                  isScored ? 'ML DIAGNOSED' :
+                                    isPlaybook ? 'PLAYBOOK SELECTED' :
+                                      isPlan ? 'PLAN CREATED' :
+                                        isWait ? 'WAITING / SCHEDULED' :
+                                          isRechecked ? 'STATUS RECHECKED' :
+                                            isNativeMonitoring ? 'RAZORPAY MONITORING' :
+                                              isGuard ? 'GUARDRAIL CHECK' :
+                                                isRecovered ? 'RECOVERED' : 'ACTION DISPATCHED'}
                               </span>
                             </div>
                           </div>
                         </td>
 
-                        <td className="py-3.5 px-3 whitespace-nowrap">
-                          <div className="font-mono text-[11px] font-bold text-gray-900">{ev.payment_id}</div>
-                          <div className="text-[10px] text-gray-400">₹{ev.amount.toLocaleString()}</div>
+                        <td className="py-3 px-3 align-top whitespace-nowrap">
+                          <div
+                            className="font-mono text-[11px] font-bold text-gray-900 bg-gray-50 border border-gray-100 px-1.5 py-0.5 rounded inline-block max-w-[140px] truncate"
+                            title={ev.payment_id}
+                          >
+                            {shortPaymentId}
+                          </div>
+                          <div className="text-[11px] font-bold text-gray-700 mt-1">₹{ev.amount?.toLocaleString()}</div>
                         </td>
 
-                        <td className="py-3.5 px-3">
-                          <div className="font-medium text-gray-800 text-xs">{ev.sublabel || ev.label}</div>
+                        <td className="py-3 px-3 align-top">
+                          <div className="font-medium text-gray-800 text-xs leading-relaxed max-w-sm">
+                            {ev.sublabel || ev.label}
+                          </div>
                           {ev.razorpay_url && (
                             <a
                               href={ev.razorpay_url}
                               target="_blank"
                               rel="noreferrer"
-                              className="inline-flex items-center gap-1 text-[11px] font-bold text-indigo-600 hover:text-indigo-800 mt-0.5 underline"
+                              className="inline-flex items-center gap-1 text-[11px] font-bold text-indigo-600 hover:text-indigo-800 mt-1 underline"
                             >
                               Open Live Payment Link <ExternalLink className="h-3 w-3" />
                             </a>
                           )}
                         </td>
 
-                        <td className="py-3.5 px-3 text-right whitespace-nowrap">
-                          <span className={`inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[10px] font-bold ${
-                            isRecovered ? 'bg-emerald-100 text-emerald-800' :
-                            isWait ? 'bg-amber-50 text-amber-700' :
-                            isNativeMonitoring ? 'bg-cyan-50 text-cyan-800' :
-                            isFailed ? 'bg-pink-50 text-pink-700' : 'bg-indigo-50 text-indigo-700'
-                          }`}>
-                            <span className={`h-1.5 w-1.5 rounded-full ${
-                              isRecovered ? 'bg-emerald-600' :
-                              isWait ? 'bg-amber-500 animate-ping' :
-                              isNativeMonitoring ? 'bg-cyan-600' :
-                              isFailed ? 'bg-pink-500' : 'bg-indigo-500'
-                            }`} />
-                            {isRecovered ? 'VERIFIED' : isWait ? 'WAITING' : isNativeMonitoring ? 'MONITORING' : 'PROCESSED'}
+                        <td className="py-3 px-3 text-right whitespace-nowrap align-top">
+                          <span className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[10px] font-bold border ${statusColor}`}>
+                            <span className={`h-1.5 w-1.5 rounded-full ${dotColor}`} />
+                            {statusLabel}
                           </span>
                         </td>
                       </tr>
@@ -515,7 +555,7 @@ export default function AgentConsolePage() {
                 ) : (
                   <tr>
                     <td colSpan={5} className="py-8 text-center text-xs text-gray-400">
-                      No live events captured yet. Click <strong>Test Webhook</strong> to simulate.
+                      No live events captured yet. Click <strong>Test</strong> to simulate a payment failure.
                     </td>
                   </tr>
                 )}
@@ -535,7 +575,7 @@ export default function AgentConsolePage() {
 
         {/* Right Column: Decisions + Active Playbook + Agent Controls */}
         <div className="space-y-6">
-          
+
           {/* Card 1: Today's Decisions (Donut Chart) */}
           <div className="bg-white rounded-[28px] border border-gray-100 p-6 shadow-sm space-y-4">
             <div className="flex justify-between items-center">
@@ -672,7 +712,7 @@ export default function AgentConsolePage() {
           {/* Card 3: Agent Controls */}
           <div className="bg-white rounded-[28px] border border-gray-100 p-6 shadow-sm space-y-3">
             <h3 className="text-sm font-bold text-gray-900">Agent Controls</h3>
-            
+
             <div className="grid grid-cols-4 gap-2 text-center">
               <button
                 onClick={toggleAgent}
