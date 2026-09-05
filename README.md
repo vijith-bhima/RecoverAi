@@ -188,9 +188,9 @@ The table below traces the exact step-by-step lifecycle of an event across the c
 | **4. ML Predict** | Random Forest model calculates recovery likelihood | [`models/train.py:75`](file:///c:/RecoverAi/models/train.py#L75) | Reads `encoder_metadata.pkl` | `RecoveryScore` ($P$, EV, Tier) |
 | **5. Plan** | LLM/Router generates structured recovery roadmap | [`core/agent.py:340`](file:///c:/RecoverAi/core/agent.py#L340) | Inserts into `recovery_plans` | `RecoveryPlan` (Steps 1..N) |
 | **6. Guard** | Evaluates deterministic safety rules R1–R7 | [`core/guardrails.py:92`](file:///c:/RecoverAi/core/guardrails.py#L92) | Queries recent `recovery_attempts` | `APPROVED` or `BLOCKED` |
-| **7. Execute** | Dispatches live Razorpay link via SMS/Email | [`core/executor.py:64`](file:///c:/RecoverAi/core/executor.py#L64) | Calls `https://api.razorpay.com/v1/payment_links` | `RecoveryAttempt` written (`PENDING`) |
+| **7. Execute / Monitor** | Monitors native Razorpay recovery, or conditionally dispatches one link only after eligibility is confirmed | [`core/executor.py`](C:/RecoverAi/backend/core/executor.py) | Reserves `recovery_links` before any gateway call | Native path monitored, or one `PENDING` RecoverAI link attempt |
 | **8. Audit** | Records complete decision trail and score telemetry | [`core/audit.py:37`](file:///c:/RecoverAi/core/audit.py#L37) | Inserts into `audit_logs` | Immutable `evt_...` record |
-| **9. Verify** | Receives `payment.captured` or polls status | [`api/main.py:1652`](file:///c:/RecoverAi/api/main.py#L1652) | Updates `payments.status` & attempts | State: `RECOVERED` |
+| **9. Verify / Reconcile** | Receives `payment.captured`, `payment.link.paid`, or rechecks gateway status | [`api/main.py`](C:/RecoverAi/backend/api/main.py) | Updates tenant payment state, or records a Ghost Revenue incident if no internal match exists | `RECOVERED` only after confirmation; no order or charge is auto-created |
 
 ---
 
@@ -202,8 +202,10 @@ RecoverAI evaluates incoming failure reasons against distinct playbooks and row-
 | :--- | :--- | :--- | :--- | :--- |
 | **`BANK_SERVER_DOWN`** | Transient issuer downtime | `INTELLIGENT_RETRY` | `WAIT_AND_RECHECK` (10s) $\rightarrow$ `SEND_PAYMENT_LINK` | Retry limit (2) or Max Cooldown reached |
 | **`NETWORK_TIMEOUT`** | Latency / dropped packet | `INTELLIGENT_RETRY` | `WAIT_AND_RECHECK` (10s) $\rightarrow$ `SEND_PAYMENT_LINK` | Transaction settled or Max attempts reached |
-| **`INSUFFICIENT_FUNDS`** | Account balance deficiency | `FUNDS_COOLDOWN_REMINDER` | Cooldown period $\rightarrow$ Flexible Multi-Method Link | 2 failed contact attempts without response |
+| **`INSUFFICIENT_FUNDS`** | Account balance deficiency | `FUNDS_COOLDOWN_REMINDER` | Persist cooldown $\rightarrow$ gateway recheck $\rightarrow$ one eligible flexible link | Paid status, Razorpay-native path, existing link, or contact limits |
 | **`CARD_EXPIRED`** | Invalid payment instrument | `ALTERNATE_PAYMENT_LINK` | `ALTERNATE_PAYMENT_METHOD` (UPI / NetBanking Link) | Direct card retry blocked by Rule R3 |
+| **`INTERNATIONAL_CARD_UNSUPPORTED`** | Razorpay alternate checkout available | `RAZORPAY_FALLBACK_MONITORING` | Monitor Razorpay only | No RecoverAI retry, link, message, or Promise-to-Pay |
+| **`SUBSCRIPTION_RETRY_ACTIVE`** | Razorpay native subscription retry in progress | `NATIVE_RETRY_MONITORING` | Monitor Razorpay only | No RecoverAI retry, link, message, or Promise-to-Pay |
 | **`INVALID_OTP`** | Authentication failure/timeout | `INTELLIGENT_RETRY` | Direct 1-Click Renewal Link | Customer ignores renewal link |
 | **`CHECKOUT_ABANDONED`**| Cart funnel drop-off | `CHECKOUT_ABANDONMENT_RECOVERY`| Personalized recovery payment link | 24-hour expiry without conversion |
 | **`FRAUD_SUSPECTED`** | High-risk telemetry / stolen card | `BOUNDED_ESCALATION` | `ESCALATE_TO_HUMAN` | Autonomous recovery prohibited (Rule R7) |
@@ -341,7 +343,7 @@ flowchart LR
 
 ## Database Architecture
 
-RecoverAI uses SQLite with **Write-Ahead Logging (WAL)** and foreign key enforcement (`PRAGMA journal_mode=WAL`, `PRAGMA foreign_keys=ON`) in [`db.py`](file:///c:/RecoverAi/db.py):
+RecoverAI supports **SQLite/WAL for local development** and **PostgreSQL for production** through the same tenant-scoped repository layer in [`db.py`](C:/RecoverAi/backend/db.py). SQLite enables `PRAGMA journal_mode=WAL` and foreign keys locally; PostgreSQL uses numbered SQL migrations in production:
 
 ```mermaid
 erDiagram
@@ -351,11 +353,14 @@ erDiagram
     MERCHANTS ||--o{ CHECKOUTS : "tracks"
     MERCHANTS ||--o{ RECOVERY_PLANS : "manages"
     MERCHANTS ||--o{ RECOVERY_ATTEMPTS : "executes"
+    MERCHANTS ||--o{ RECOVERY_LINKS : "owns one active link per payment"
+    MERCHANTS ||--o{ GHOST_REVENUE_INCIDENTS : "reconciles"
     MERCHANTS ||--o{ AUDIT_LOGS : "audits"
     CUSTOMERS ||--o{ PAYMENTS : "initiates"
     CUSTOMERS ||--o{ CHECKOUTS : "abandons"
     PAYMENTS ||--o{ RECOVERY_PLANS : "generates"
     PAYMENTS ||--o{ RECOVERY_ATTEMPTS : "triggers"
+    PAYMENTS ||--o| RECOVERY_LINKS : "has at most one"
     PAYMENTS ||--o{ AUDIT_LOGS : "logs"
     PAYMENTS ||--o| GROUND_TRUTH : "evaluates"
 
@@ -415,6 +420,21 @@ erDiagram
         string reason
         string channel_used
     }
+    RECOVERY_LINKS {
+        string recovery_link_id PK
+        string merchant_id FK
+        string payment_id
+        string status
+        string razorpay_link_id
+        string short_url
+    }
+    GHOST_REVENUE_INCIDENTS {
+        string incident_id PK
+        string merchant_id FK
+        string razorpay_payment_id
+        string issue_type
+        string status
+    }
     AUDIT_LOGS {
         string event_id PK
         string merchant_id FK
@@ -429,6 +449,9 @@ erDiagram
         string result
     }
 ```
+
+
+`recovery_links` has a unique `(merchant_id, payment_id)` key. It is the shared idempotency guard for automated workers, webhooks, retries, and manual dispatch. `ghost_revenue_incidents` and `ghost_revenue_events` preserve tenant-scoped evidence for Razorpay-confirmed captures that lack a safe internal order/recovery match. PostgreSQL production deployments apply `001_initial.sql`, `002_ghost_revenue.sql`, and `003_recovery_link_guard.sql` in order; SQLite/WAL remains supported for local development.
 
 ---
 
@@ -449,7 +472,7 @@ The backend exposes strongly-typed, Pydantic-validated REST endpoints ([`api/mai
 ### 2. Payments, Webhooks & Ingestion
 | Method | Endpoint | Description | Auth Required |
 | :--- | :--- | :--- | :--- |
-| `POST` | `/webhooks/razorpay` | Production Razorpay webhook receiver (`payment.failed`, `payment.captured`) | HMAC Signature |
+| `POST` | `/webhooks/razorpay` | Production Razorpay webhook receiver (`payment.failed`, `payment.captured`, `payment.link.paid`) | HMAC Signature |
 | `POST` | `/payments/event` | Ingest new failed payment event into recovery queue | **Yes (Bearer / API Key)** |
 | `GET` | `/payments` | List tenant payments with pagination and status filters | **Yes (Bearer / API Key)** |
 | `GET` | `/payments/{payment_id}` | Retrieve individual payment details | **Yes (Bearer / API Key)** |
@@ -462,6 +485,8 @@ The backend exposes strongly-typed, Pydantic-validated REST endpoints ([`api/mai
 | `POST` | `/recovery/run/{payment_id}` | Execute full agent recovery pipeline on specific payment | **Yes (Bearer / API Key)** |
 | `GET` | `/recovery/opportunities` | List prioritised revenue recovery queue sorted by EV | **Yes (Bearer / API Key)** |
 | `GET` | `/recovery/plan/{payment_id}` | Fetch structured multi-step recovery plan for a payment | **Yes (Bearer / API Key)** |
+| `GET` | `/recovery/passport/{payment_id}` | Explain eligibility, native ownership, and attribution before outreach | **Yes (Bearer / API Key)** |
+| `POST` | `/recovery/promise-to-pay` | Record an eligible customer commitment for a halted subscription or overdue invoice | **Yes (Bearer / API Key)** |
 | `GET` | `/recovery/escalations` | List payments escalated to human review queue | **Yes (Bearer / API Key)** |
 | `POST` | `/recovery/resolve` | Mark an escalated payment as resolved/actioned | **Yes (Bearer / API Key)** |
 | `GET` | `/agent/activity` | Stream real-time agent execution events | **Yes (Bearer / API Key)** |
@@ -478,6 +503,8 @@ The backend exposes strongly-typed, Pydantic-validated REST endpoints ([`api/mai
 | `POST` | `/api/settings` | Update autonomous amount limits, cooldowns, and channels | **Yes (Bearer / API Key)** |
 | `POST` | `/api/settings/test-razorpay`| Validate live Razorpay API key and secret | **Yes (Bearer / API Key)** |
 | `GET` | `/reports/export/csv` | Download complete audit trail and recovery records as CSV | **Yes (Bearer / API Key)** |
+| `GET` | `/ghost-revenue/incidents` | List tenant-scoped captured-but-unreconciled Razorpay incidents | **Yes (Bearer / API Key)** |
+| `POST` | `/ghost-revenue/incidents/{incident_id}/resolve` | Explicitly record order verification/restoration or escalation | **Yes (Bearer / API Key)** |
 
 ---
 
@@ -519,7 +546,7 @@ The repository contains real application UI assets located in [`frontend/public/
 
 RecoverAI has been rigorously validated across automated unit tests, end-to-end integration pipelines, and multi-tenant security barriers.
 
-### 1. Automated Test Suite (47 Tests — 100% Passing)
+### 1. Automated Test Suite (49 Tests — 100% Passing)
 
 Run the test suite locally:
 ```bash
@@ -530,21 +557,23 @@ pytest -v
 ============================= test session starts =============================
 platform win32 -- Python 3.14.6, pytest-9.0.3, pluggy-1.6.0
 rootdir: C:\RecoverAi
-collected 47 items
+collected 49 items
 
 tests/test_guardrails.py ....................                            [ 42%]
 tests/test_diagnosis.py ..                                               [ 46%]
 tests/test_pipeline.py ...................                               [ 87%]
 tests/test_multi_tenant_security.py ......                               [100%]
 
-============================== 47 passed in 12.87s =============================
+============================== 49 passed =============================
 ```
 
 #### Test Suite Breakdown
 * **`tests/test_guardrails.py` (20 tests):** Verifies each guardrail rule in isolation (`R1` duplicate prevention, `R2` ₹10,000 ceiling, `R3` card expired block, `R4` 2-attempt limit, `R5` 6-hour cooldown, `R6` 2-contact ceiling, `R7` fraud tripwires).
 * **`tests/test_diagnosis.py` (2 tests):** Verifies transient vs permanent failure classification and baseline scoring logic.
 * **`tests/test_pipeline.py` (19 tests):** Verifies end-to-end event flow, LTV boosting, Pydantic schema validation, and metric computation.
-* **`tests/test_multi_tenant_security.py` (6 tests):** Verifies tenant registration, JWT token generation, IDOR prevention, customer isolation, opportunity isolation, and agent execution isolation.
+* **`tests/test_multi_tenant_security.py`:** Verifies tenant registration, JWT token generation, IDOR prevention, customer isolation, opportunity isolation, and agent execution isolation.
+* **`tests/test_razorpay_fallback_monitoring.py`:** Verifies native Razorpay paths are monitored without RecoverAI link dispatch.
+* **`tests/test_ghost_revenue.py`:** Verifies captured-without-order incidents are idempotent and tenant-scoped.
 
 ### 2. Supervised ML Benchmark Metrics ([`evaluate.py`](file:///c:/RecoverAi/evaluate.py))
 * **Ground Truth Evaluation:** Evaluated against historical benchmark records with independent ground-truth outcomes.
@@ -617,6 +646,7 @@ In financial software, every autonomous action must be verifiable and tamper-evi
 ```
 
 * Sensitive merchant secrets, API keys, and customer credit card numbers are strictly redacted from audit payloads.
+* The Live Agent Activity distinguishes `WAITING`, `STATUS RECHECKED`, `RAZORPAY MONITORING`, live dispatch, simulated/test-only output, existing-link monitoring, and verified recovery; “processed” never proves customer delivery.
 * Complete logs are exportable as CSV via `GET /reports/export/csv` for financial accounting and compliance audits.
 
 ---
@@ -626,7 +656,9 @@ In financial software, every autonomous action must be verifiable and tamper-evi
 | Failure Mode | System Behavior & Mitigation |
 | :--- | :--- |
 | **Invalid Webhook Signature** | Returns HTTP 403; drops payload immediately; logs security warning. |
-| **Duplicate Webhook / Replay** | Rule `R1_ALREADY_SUCCESSFUL` detects existing `SUCCESS` state and halts pipeline. |
+| **Duplicate Webhook / Replay** | Tenant-scoped recovery-link reservation and recovery-job state prevent repeat dispatch; an existing link is monitored rather than resent. |
+| **Razorpay Native Retry / Alternate Checkout** | `INTERNATIONAL_CARD_UNSUPPORTED` and `SUBSCRIPTION_RETRY_ACTIVE` are monitoring-only; no link, retry, customer contact, or Promise-to-Pay is created. |
+| **Captured Payment Without Internal Match** | Ghost Revenue Hunter creates one tenant-scoped reconciliation incident; it never auto-creates an order, charges again, or captures funds. |
 | **LLM Provider Outage (Groq 429/500)** | Automatically falls back through `GroqProvider` $\rightarrow$ `OllamaProvider` $\rightarrow$ `MockProvider`. Pipeline never crashes. |
 | **Razorpay API Timeout / Error** | Catches `requests.exceptions.RequestException`, marks attempt `FAILED`, queues payment for retry or human review. |
 | **Customer Contact Limit Reached** | Rule `R6_CONTACT_LIMIT` halts all further messaging to prevent customer spam. |
@@ -756,7 +788,10 @@ To maintain absolute engineering integrity, the following current limitations ar
 - [x] Multi-tenant authentication with PBKDF2 password hashing & JWT tokens.
 - [x] Next.js 16 executive dashboard and interactive real-time Agent Console.
 - [x] Immutable audit trail with CSV export capability.
-- [x] 47 automated unit, pipeline, and security tests.
+- [x] 49 automated unit, pipeline, tenant-isolation, native-fallback, and Ghost Revenue tests.
+- [x] Native-first Razorpay recovery: alternate checkout and active subscription retries are monitoring-only.
+- [x] Tenant-scoped one-active-link guard shared by worker, webhook, retry, and manual dispatch.
+- [x] Ghost Revenue Hunter for captured Razorpay payments without a safe internal order/recovery match.
 
 ### Planned (Future Work) 🚀
 - [x] PostgreSQL baseline schema migration and runtime database compatibility.
