@@ -231,6 +231,28 @@ def _log_event(event_type: str, merchant_id: str = "mer_default", user_id: str =
         _agent["activity"].appendleft(entry)   # newest first
 
 
+_NATIVE_RAZORPAY_FAILURES = {
+    FailureReason.INTERNATIONAL_CARD_UNSUPPORTED,
+    FailureReason.SUBSCRIPTION_RETRY_ACTIVE,
+}
+
+
+def _is_native_razorpay_failure(reason: FailureReason | str | None) -> bool:
+    """True when Razorpay owns the retry or alternate checkout."""
+    value = reason.value if isinstance(reason, FailureReason) else reason
+    return value in {item.value for item in _NATIVE_RAZORPAY_FAILURES}
+
+
+def _log_native_recovery_monitoring(*, merchant_id: str, user_id: str, payment_id: str, amount: float) -> None:
+    _log_event(
+        "razorpay_native_monitoring",
+        merchant_id=merchant_id,
+        user_id=user_id,
+        payment_id=payment_id,
+        amount=amount,
+        label="👀 Monitoring Razorpay native recovery",
+        sublabel="Razorpay retry or alternate checkout is active; RecoverAI did not create a link or contact the customer.",
+    )
 def _process_new_failures() -> int:
     """Find unprocessed FAILED payments and run the full pipeline on each."""
     with get_connection() as conn:
@@ -338,7 +360,9 @@ def _process_new_failures() -> int:
                     if m:
                         razorpay_url = m.group(0)
 
-                if action in ("SEND_PAYMENT_LINK", "ALTERNATE_PAYMENT_METHOD"):
+                if _is_native_razorpay_failure(payment.failure_reason):
+                    _log_native_recovery_monitoring(merchant_id=row_mid, user_id=row_uid, payment_id=payment.payment_id, amount=payment.amount)
+                elif action in ("SEND_PAYMENT_LINK", "ALTERNATE_PAYMENT_METHOD"):
                     _log_event("link_sent", merchant_id=row_mid, user_id=row_uid,
                         payment_id=payment.payment_id, amount=payment.amount,
                         label="⚡ Live payment link dispatched" if razorpay_url else "🧪 Simulated/test link only",
@@ -569,12 +593,9 @@ def _process_due_scheduled_jobs() -> int:
         # Razorpay is already presenting alternate methods in its own checkout.
         # Mark the case as monitored and wait for a captured-payment webhook;
         # creating another link here would duplicate the customer's recovery path.
-        if payment.failure_reason == FailureReason.INTERNATIONAL_CARD_UNSUPPORTED:
-            _log_event("razorpay_fallback_monitoring", merchant_id=job_mid, user_id=job_user_id,
-                payment_id=payment_id, amount=payment.amount,
-                label="👀 Monitoring Razorpay alternate-payment checkout",
-                sublabel="UPI / local alternatives are already available; no duplicate payment link was sent")
-            update_job_stage(job_id, stage="RAZORPAY_FALLBACK_MONITORING", status="COMPLETED", recheck_result="MONITORING_RAZORPAY_FALLBACK")
+        if _is_native_razorpay_failure(payment.failure_reason):
+            _log_native_recovery_monitoring(merchant_id=job_mid, user_id=job_user_id, payment_id=payment_id, amount=payment.amount)
+            update_job_stage(job_id, stage="RAZORPAY_FALLBACK_MONITORING", status="COMPLETED", recheck_result="MONITORING_RAZORPAY_NATIVE")
             processed_count += 1
             continue
 
@@ -677,7 +698,12 @@ def _bootstrap_agent_state():
     try:
         with get_connection() as conn:
             total_attempts = conn.execute("SELECT COUNT(*) as c FROM recovery_attempts").fetchone()["c"]
-            links = conn.execute("SELECT COUNT(*) as c FROM recovery_attempts WHERE action = 'SEND_PAYMENT_LINK'").fetchone()["c"]
+            links = conn.execute("""
+                SELECT COUNT(*) AS c FROM recovery_attempts r
+                JOIN payments p ON p.payment_id = r.payment_id AND p.merchant_id = r.merchant_id
+                WHERE r.action IN ('SEND_PAYMENT_LINK', 'ALTERNATE_PAYMENT_METHOD')
+                  AND p.failure_reason NOT IN ('INTERNATIONAL_CARD_UNSUPPORTED', 'SUBSCRIPTION_RETRY_ACTIVE')
+            """).fetchone()["c"]
             escalated = conn.execute("SELECT COUNT(*) as c FROM recovery_attempts WHERE action = 'ESCALATE_TO_HUMAN'").fetchone()["c"]
             recovered = conn.execute("""
                 SELECT COALESCE(SUM(p.amount), 0.0) as rev
@@ -700,6 +726,7 @@ def _bootstrap_agent_state():
                 LIMIT 50
             """).fetchall()
 
+            native_monitoring_seen: set[tuple[str, str]] = set()
             for row in reversed(recent):
                 action = row["action"]
                 amt = row["amount"] or 0
@@ -709,7 +736,9 @@ def _bootstrap_agent_state():
                     if m:
                         razorpay_url = m.group(0)
 
-                if action == "SEND_PAYMENT_LINK":
+                if _is_native_razorpay_failure(row["failure_reason"]):
+                    _log_native_recovery_monitoring(merchant_id=row["merchant_id"], user_id=row["user_id"], payment_id=row["payment_id"], amount=amt)
+                elif action in ("SEND_PAYMENT_LINK", "ALTERNATE_PAYMENT_METHOD"):
                     _log_event("link_sent", merchant_id=row["merchant_id"], user_id=row["user_id"], payment_id=row["payment_id"], amount=amt,
                                label="⚡ Live payment link dispatched" if razorpay_url else "🧪 Simulated/test link only",
                                sublabel="Razorpay link dispatched to customer" if razorpay_url else (row["reason"][:80] if row["reason"] else ""),
@@ -2722,7 +2751,7 @@ def auto_run_recovery(request: Request):
                 audit     = write_audit_log(score, decision, guardrail, attempt, merchant_id=merchant_id, user_id=user["user_id"])
 
                 action = guardrail.final_action.value
-                if action == "SEND_PAYMENT_LINK":
+                if not _is_native_razorpay_failure(row["failure_reason"]) and action in ("SEND_PAYMENT_LINK", "ALTERNATE_PAYMENT_METHOD"):
                     links_generated += 1
                 elif action == "ESCALATE_TO_HUMAN":
                     escalated += 1

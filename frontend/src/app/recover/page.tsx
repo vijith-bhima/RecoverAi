@@ -412,6 +412,7 @@ export default function AgentConsolePage() {
                     const isPlan = ev.type === 'recovery_plan_created';
                     const isWait = ev.type === 'wait_scheduled';
                     const isRechecked = ev.type === 'status_rechecked';
+                    const isNativeMonitoring = ev.type === 'razorpay_native_monitoring' || ev.type === 'razorpay_fallback_monitoring';
                     const isGuard = ev.type === 'guardrail_approved' || ev.type === 'guardrail_blocked';
                     const isAction = ev.type === 'link_sent' || ev.type === 'retried' || ev.type === 'escalated';
                     const isRecovered = ev.type === 'recovered';
@@ -432,6 +433,7 @@ export default function AgentConsolePage() {
                               isPlan ? 'bg-sky-50 text-sky-600' :
                               isWait ? 'bg-amber-50 text-amber-600 animate-pulse' :
                               isRechecked ? 'bg-blue-50 text-blue-600' :
+                              isNativeMonitoring ? 'bg-cyan-50 text-cyan-700' :
                               isGuard ? 'bg-emerald-50 text-emerald-600' :
                               isRecovered ? 'bg-emerald-100 text-emerald-700 font-bold' : 'bg-indigo-50 text-indigo-600'
                             }`}>
@@ -441,6 +443,7 @@ export default function AgentConsolePage() {
                                isPlan ? '🗺️' :
                                isWait ? '⏳' :
                                isRechecked ? '🔍' :
+                               isNativeMonitoring ? '👀' :
                                isGuard ? '🛡️' :
                                isRecovered ? '✅' : '⚡'}
                             </div>
@@ -453,6 +456,7 @@ export default function AgentConsolePage() {
                                 isPlan ? 'bg-sky-100 text-sky-700' :
                                 isWait ? 'bg-amber-100 text-amber-800 font-extrabold' :
                                 isRechecked ? 'bg-blue-100 text-blue-700' :
+                                isNativeMonitoring ? 'bg-cyan-100 text-cyan-800' :
                                 isGuard ? 'bg-emerald-100 text-emerald-700' :
                                 isRecovered ? 'bg-emerald-200 text-emerald-900' : 'bg-indigo-100 text-indigo-700'
                               }`}>
@@ -462,6 +466,7 @@ export default function AgentConsolePage() {
                                  isPlan ? 'PLAN CREATED' :
                                  isWait ? 'WAITING / SCHEDULED' :
                                  isRechecked ? 'STATUS RECHECKED' :
+                                 isNativeMonitoring ? 'RAZORPAY MONITORING' :
                                  isGuard ? 'GUARDRAIL CHECK' :
                                  isRecovered ? 'RECOVERED' : 'ACTION DISPATCHED'}
                               </span>
@@ -492,14 +497,16 @@ export default function AgentConsolePage() {
                           <span className={`inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[10px] font-bold ${
                             isRecovered ? 'bg-emerald-100 text-emerald-800' :
                             isWait ? 'bg-amber-50 text-amber-700' :
+                            isNativeMonitoring ? 'bg-cyan-50 text-cyan-800' :
                             isFailed ? 'bg-pink-50 text-pink-700' : 'bg-indigo-50 text-indigo-700'
                           }`}>
                             <span className={`h-1.5 w-1.5 rounded-full ${
                               isRecovered ? 'bg-emerald-600' :
                               isWait ? 'bg-amber-500 animate-ping' :
+                              isNativeMonitoring ? 'bg-cyan-600' :
                               isFailed ? 'bg-pink-500' : 'bg-indigo-500'
                             }`} />
-                            {isRecovered ? 'VERIFIED' : isWait ? 'WAITING' : 'PROCESSED'}
+                            {isRecovered ? 'VERIFIED' : isWait ? 'WAITING' : isNativeMonitoring ? 'MONITORING' : 'PROCESSED'}
                           </span>
                         </td>
                       </tr>
